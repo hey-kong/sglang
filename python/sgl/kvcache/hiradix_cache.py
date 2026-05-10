@@ -29,6 +29,9 @@ class HiRadixTreeNode:
         HiRadixTreeNode.counter += 1
         self.timestamp = tic or time.monotonic_ns()
         self.freq = 0
+        # Hash of all token ids on the path from the root through this node.
+        # It is equivalent to hash(tuple(prefix_ids + current_node_ids)).
+        self.prefix_hash = hash(())
 
         # these fields should be updated later
         self._key: torch.Tensor
@@ -56,7 +59,21 @@ class HiRadixTreeNode:
 
     def set_parent(self, parent: HiRadixTreeNode) -> None:
         self._parent = parent
+        self.prefix_hash = self._compute_prefix_hash()
         parent.children[self.key_fn(self._key)] = self
+
+    def _compute_prefix_hash(self) -> int:
+        parts: List[torch.Tensor] = []
+        node: HiRadixTreeNode = self
+        while not node.is_root():
+            parts.append(node._key)
+            node = node.parent
+        parts.reverse()
+
+        prefix_ids: List[int] = []
+        for part in parts:
+            prefix_ids.extend(part.tolist())
+        return hash(tuple(prefix_ids))
 
     @property
     def length(self) -> int:

@@ -47,3 +47,21 @@ def test_lfu_evicts_least_frequently_hit_node():
     assert first.freq == 2
     assert second.freq == 0
     assert cache.evict(1).tolist() == [22]
+
+
+def test_node_prefix_hash_tracks_full_prefix_ids_after_split():
+    cache = HiRadixPrefixCache(device=torch.device("cpu"), hicache_policy="lru")
+    cache.insert_prefix(
+        torch.tensor([1, 2, 3], dtype=torch.int32),
+        torch.tensor([11, 22, 33], dtype=torch.int32),
+    )
+
+    cache.insert_prefix(
+        torch.tensor([1, 2, 4], dtype=torch.int32),
+        torch.tensor([11, 22, 44], dtype=torch.int32),
+    )
+
+    prefix_node = cache.root_node.children[1]
+    assert prefix_node.prefix_hash == hash((1, 2))
+    assert prefix_node.children[3].prefix_hash == hash((1, 2, 3))
+    assert prefix_node.children[4].prefix_hash == hash((1, 2, 4))
