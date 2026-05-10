@@ -65,3 +65,18 @@ def test_node_prefix_hash_tracks_full_prefix_ids_after_split():
     assert prefix_node.prefix_hash == hash((1, 2))
     assert prefix_node.children[3].prefix_hash == hash((1, 2, 3))
     assert prefix_node.children[4].prefix_hash == hash((1, 2, 4))
+
+
+def test_host_eviction_records_prefix_hash_in_ghost():
+    cache = HiRadixPrefixCache(device=torch.device("cpu"), hicache_policy="lru", ghost_capacity=4)
+    result = cache.insert_prefix(
+        torch.tensor([7], dtype=torch.int32),
+        torch.tensor([77], dtype=torch.int32),
+    )
+    cache.set_host(result.handle, torch.tensor([177], dtype=torch.int32))
+    assert cache.evict(1).tolist() == [77]
+
+    evicted_host_indices = cache.try_evict_host(1)
+
+    assert [indices.tolist() for indices in evicted_host_indices] == [[177]]
+    assert cache.ghost.exists(hash((7,)))

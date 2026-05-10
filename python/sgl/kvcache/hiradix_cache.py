@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import heapq
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Literal, Tuple, TypeAlias
+from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple, TypeAlias
 
 import torch
 from sgl.core import get_global_ctx
@@ -15,6 +16,78 @@ KEY_FN: TypeAlias = Callable[[torch.Tensor], Any]
 HICACHE_POLICY: TypeAlias = Literal["lru", "slru", "fifo", "lfu"]
 
 logger = init_logger(__name__)
+
+
+class Ghost:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.queue: OrderedDict[Tuple[int, Optional[Tuple[int, ...]]], None] = OrderedDict()
+        self.index: dict[int, Set[Optional[Tuple[int, ...]]]] = {}
+
+    def put(self, key: int, value: Optional[List[int]] = None):
+        v: Optional[Tuple[int, ...]] = tuple(value) if value is not None else None
+        entry = (key, v)
+
+        if entry not in self.queue:
+            self.queue[entry] = None
+            if key not in self.index:
+                self.index[key] = set()
+            self.index[key].add(v)
+
+        while len(self.queue) > self.capacity:
+            old_entry, _ = self.queue.popitem(last=False)
+            old_k, old_v = old_entry
+            self.index[old_k].remove(old_v)
+            if not self.index[old_k]:
+                del self.index[old_k]
+
+    def remove(self, key: int, value: Optional[List[int]] = None):
+        if key not in self.index:
+            return
+
+        if value is None:
+            vals_to_remove = list(self.index[key])
+            for v in vals_to_remove:
+                entry = (key, v)
+                self.queue.pop(entry, None)
+            del self.index[key]
+            return
+
+        v_tuple = tuple(value)
+        entry = (key, v_tuple)
+
+        self.queue.pop(entry, None)
+
+        if v_tuple in self.index[key]:
+            self.index[key].remove(v_tuple)
+            if not self.index[key]:
+                del self.index[key]
+
+    def exists(self, key: int, value: Optional[List[int]] = None) -> bool:
+        if key not in self.index:
+            return False
+        v = tuple(value) if value is not None else None
+        return v in self.index[key]
+
+    def is_empty(self) -> bool:
+        return len(self.queue) == 0
+
+    def __contains__(self, key: int) -> bool:
+        return key in self.index
+
+    def __len__(self):
+        return len(self.queue)
+
+    def print_ghost(self):
+        if not self.queue:
+            print("Ghost contents: None")
+            return
+        print("Ghost contents (FIFO order):")
+        for k, v in self.queue.keys():
+            print(f"  ({k}, {list(v) if v is not None else None})")
+
+    def __repr__(self):
+        return f"{list(self.queue.keys())}"
 
 
 class HiRadixTreeNode:
@@ -162,7 +235,12 @@ class HiRadixCacheHandle(BaseCacheHandle):
 
 
 class HiRadixPrefixCache(BasePrefixCache):
-    def __init__(self, device: torch.device, hicache_policy: HICACHE_POLICY = "lru"):
+    def __init__(
+        self,
+        device: torch.device,
+        hicache_policy: HICACHE_POLICY = "lru",
+        ghost_capacity: int = 1024,
+    ):
         super().__init__()
         self.device = device
         assert hicache_policy in ("lru", "slru", "fifo", "lfu")
@@ -172,6 +250,7 @@ class HiRadixPrefixCache(BasePrefixCache):
         self.empty_tensor = torch.empty(0, dtype=torch.int32, device=device)
         self.evictable_size = 0
         self.protected_size = 0
+        self.ghost = Ghost(ghost_capacity)
         self.root_node = HiRadixTreeNode(self.key_fn)
         self.root_node.ref_count = 1  # root is always protected
 
@@ -275,6 +354,7 @@ class HiRadixPrefixCache(BasePrefixCache):
 
             evicted_size += node.length
             evicted_indices.append(node.host_value)
+            self.ghost.put(node.prefix_hash)
             parent = node.parent
             del parent.children[self.key_fn(node._key)]
             if parent.ref_count == 0 and parent.is_leaf_host():
