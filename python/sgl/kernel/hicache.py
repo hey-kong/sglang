@@ -162,7 +162,7 @@ def _allocate_torch_host(*shape: int, dtype: torch.dtype) -> torch.Tensor:
 
 
 def allocate_host(*shape: int, dtype: torch.dtype) -> torch.Tensor:
-    allocator = os.environ.get(_HOST_ALLOCATOR_ENV, "numa").strip().lower()
+    allocator = os.environ.get(_HOST_ALLOCATOR_ENV, "torch").strip().lower()
     if allocator in ("torch", "pytorch"):
         return _allocate_torch_host(*shape, dtype=dtype)
     if allocator != "numa":
