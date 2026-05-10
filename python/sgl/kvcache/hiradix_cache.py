@@ -3,7 +3,7 @@ from __future__ import annotations
 import heapq
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Tuple, TypeAlias
+from typing import Any, Callable, Dict, List, Literal, Tuple, TypeAlias
 
 import torch
 from sgl.core import get_global_ctx
@@ -12,6 +12,7 @@ from sgl.utils import align_down, init_logger
 from .base import BaseCacheHandle, BasePrefixCache, InsertResult, MatchResult, SizeInfo
 
 KEY_FN: TypeAlias = Callable[[torch.Tensor], Any]
+HICACHE_POLICY: TypeAlias = Literal["lru", "slru", "fifo", "lfu"]
 
 logger = init_logger(__name__)
 
@@ -27,6 +28,7 @@ class HiRadixTreeNode:
         self.uuid = HiRadixTreeNode.counter
         HiRadixTreeNode.counter += 1
         self.timestamp = tic or time.monotonic_ns()
+        self.freq = 0
 
         # these fields should be updated later
         self._key: torch.Tensor
@@ -114,6 +116,7 @@ class HiRadixTreeNode:
         )
         new_node.set_parent(parent)
         new_node.ref_count = self.ref_count
+        new_node.freq = self.freq
         self.set_key_value(
             self._key[pos:],
             _maybe_slice(self._cuda_value, slice(pos, None)),
@@ -142,9 +145,11 @@ class HiRadixCacheHandle(BaseCacheHandle):
 
 
 class HiRadixPrefixCache(BasePrefixCache):
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, hicache_policy: HICACHE_POLICY = "lru"):
         super().__init__()
         self.device = device
+        assert hicache_policy in ("lru", "slru", "fifo", "lfu")
+        self.hicache_policy = hicache_policy
         self.page_size = get_global_ctx().page_size
         self.key_fn = _get_key_fn(self.page_size)
         self.empty_tensor = torch.empty(0, dtype=torch.int32, device=device)
@@ -211,9 +216,9 @@ class HiRadixPrefixCache(BasePrefixCache):
     def evict(self, size: int) -> torch.Tensor:
         if size == 0:
             return self.empty_tensor
-        assert (
-            size <= self.evictable_size
-        ), f"Cannot evict {size}, only {self.evictable_size} is evictable"
+        assert size <= self.evictable_size, (
+            f"Cannot evict {size}, only {self.evictable_size} is evictable"
+        )
 
         leave_nodes = self._collect_leave_nodes_for_evict(is_host=False)
         heapq.heapify(leave_nodes)
@@ -222,7 +227,7 @@ class HiRadixPrefixCache(BasePrefixCache):
 
         while evicted_size < size:
             assert len(leave_nodes) > 0, "Not enough evictable nodes"
-            node = heapq.heappop(leave_nodes)
+            _, node = heapq.heappop(leave_nodes)
             evicted_size += node.length
             evicted_indices.append(node.cuda_value)
             self.evictable_size -= node.length
@@ -233,7 +238,7 @@ class HiRadixPrefixCache(BasePrefixCache):
                 node.cuda_value = None
             # NOTE: root is always protected, so won't be evicted
             if parent.ref_count == 0 and parent.is_leaf_device():
-                heapq.heappush(leave_nodes, parent)
+                heapq.heappush(leave_nodes, self._make_evict_candidate(parent))
 
         return torch.cat(evicted_indices)
 
@@ -247,7 +252,7 @@ class HiRadixPrefixCache(BasePrefixCache):
         evicted_size = 0
 
         while evicted_size < size and leave_nodes:
-            node = heapq.heappop(leave_nodes)
+            _, node = heapq.heappop(leave_nodes)
             if not node.on_host_only():  # still has device backup, skip eviction
                 continue
 
@@ -256,7 +261,7 @@ class HiRadixPrefixCache(BasePrefixCache):
             parent = node.parent
             del parent.children[self.key_fn(node._key)]
             if parent.ref_count == 0 and parent.is_leaf_host():
-                heapq.heappush(leave_nodes, parent)
+                heapq.heappush(leave_nodes, self._make_evict_candidate(parent))
 
         return evicted_indices
 
@@ -342,9 +347,18 @@ class HiRadixPrefixCache(BasePrefixCache):
     def check_integrity(self) -> None:
         pass
 
-    def _collect_leave_nodes_for_evict(self, is_host: bool) -> List[HiRadixTreeNode]:
+    def _make_evict_candidate(
+        self, node: HiRadixTreeNode
+    ) -> Tuple[Tuple[int, ...], HiRadixTreeNode]:
+        if self.hicache_policy == "lfu":
+            return (node.freq, node.timestamp, node.uuid), node
+        return (node.timestamp, node.uuid), node
+
+    def _collect_leave_nodes_for_evict(
+        self, is_host: bool
+    ) -> List[Tuple[Tuple[int, ...], HiRadixTreeNode]]:
         nodes: List[HiRadixTreeNode] = list(self.root_node.children.values())
-        leave_nodes: List[HiRadixTreeNode] = []
+        leave_nodes: List[Tuple[Tuple[int, ...], HiRadixTreeNode]] = []
 
         fn = HiRadixTreeNode.is_leaf_host if is_host else HiRadixTreeNode.is_leaf_device
         while len(nodes) > 0:
@@ -353,7 +367,7 @@ class HiRadixPrefixCache(BasePrefixCache):
                 continue
             if fn(node):
                 if node.ref_count == 0:
-                    leave_nodes.append(node)
+                    leave_nodes.append(self._make_evict_candidate(node))
             else:
                 for child in node.children.values():
                     nodes.append(child)
@@ -379,12 +393,18 @@ class HiRadixPrefixCache(BasePrefixCache):
             # need to split the node if not fully matched
             if match_len != node.length:
                 node = node.split_at(match_len)
+                self._update_access_stats(node, tic)
                 return node, prefix_len
 
-            # update timestamp for accessed node
-            node.timestamp = tic
+            self._update_access_stats(node, tic)
 
         return node, prefix_len
+
+    def _update_access_stats(self, node: HiRadixTreeNode, tic: int) -> None:
+        if self.hicache_policy == "lfu":
+            node.freq += 1
+        elif self.hicache_policy != "fifo":
+            node.timestamp = tic
 
 
 def _get_key_fn(page_size: int) -> KEY_FN:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from sgl.utils import Registry
 
@@ -18,7 +18,7 @@ from .base import (
 
 
 class CacheManagerCreator(Protocol):
-    def __call__(self, device: torch.device) -> BasePrefixCache: ...
+    def __call__(self, device: torch.device, **kwargs: Any) -> BasePrefixCache: ...
 
 
 SUPPORTED_CACHE_MANAGER = Registry[CacheManagerCreator]("Cache Manager")
@@ -47,28 +47,28 @@ def create_kvcache_pool(
 
 
 @SUPPORTED_CACHE_MANAGER.register("naive")
-def create_naive_cache(device: torch.device):
+def create_naive_cache(device: torch.device, **_: Any):
     from .naive_cache import NaivePrefixCache
 
     return NaivePrefixCache(device=device)
 
 
 @SUPPORTED_CACHE_MANAGER.register("radix")
-def create_radix_cache(device: torch.device):
+def create_radix_cache(device: torch.device, **_: Any):
     from .radix_cache import RadixPrefixCache
 
     return RadixPrefixCache(device=device)
 
 
 @SUPPORTED_CACHE_MANAGER.register("hiradix")
-def create_hiradix_cache(device: torch.device):
+def create_hiradix_cache(device: torch.device, **kwargs: Any):
     from .hiradix_cache import HiRadixPrefixCache
 
-    return HiRadixPrefixCache(device=device)
+    return HiRadixPrefixCache(device=device, **kwargs)
 
 
-def create_prefix_cache(device: torch.device, type: str) -> BasePrefixCache:
-    return SUPPORTED_CACHE_MANAGER[type](device)
+def create_prefix_cache(device: torch.device, type: str, **kwargs: Any) -> BasePrefixCache:
+    return SUPPORTED_CACHE_MANAGER[type](device, **kwargs)
 
 
 __all__ = [
