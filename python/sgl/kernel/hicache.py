@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import os
 import torch
 from typing import TYPE_CHECKING
 
@@ -149,14 +150,31 @@ def transfer_hicache_all_layer(
     )
 
 
+# Set this to "torch"/"pytorch" to use PyTorch's pinned-memory allocator
+# instead of NUMA-local allocation. This is useful on systems where each NUMA
+# node is smaller than the requested HiCache host pool, but system-wide memory
+# is sufficient.
+_HOST_ALLOCATOR_ENV = "SGLANG_HICACHE_HOST_ALLOCATOR"
+
+
+def _allocate_torch_host(*shape: int, dtype: torch.dtype) -> torch.Tensor:
+    return torch.empty(*shape, dtype=dtype, pin_memory=True)
+
+
 def allocate_host(*shape: int, dtype: torch.dtype) -> torch.Tensor:
-    import torch
+    allocator = os.environ.get(_HOST_ALLOCATOR_ENV, "numa").strip().lower()
+    if allocator in ("torch", "pytorch"):
+        return _allocate_torch_host(*shape, dtype=dtype)
+    if allocator != "numa":
+        raise ValueError(
+            f"Unsupported {_HOST_ALLOCATOR_ENV}={allocator!r}; expected 'numa' or 'torch'."
+        )
 
     try:
         numa_node = probe_numa_node()
         module = _jit_numa_module()
     except Exception:
-        return torch.empty(*shape, dtype=dtype, pin_memory=True)
+        return _allocate_torch_host(*shape, dtype=dtype)
     size_bytes = functools.reduce(lambda x, y: x * y, shape) * dtype.itemsize
     result = torch.from_dlpack(module.allocate_numa(size_bytes, numa_node))
     assert result.is_pinned(), "Expected pinned memory from NUMA allocator"
