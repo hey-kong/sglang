@@ -22,8 +22,12 @@ class CacheManager:
         self.device = device = page_table.device
         self.num_pages = num_pages
         self.enable_hicache = config.cache_type == "hiradix"
+        self.hicache_policy = _resolve_hicache_policy(config) if self.enable_hicache else None
         self._free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
-        self._prefix_cache = create_prefix_cache(device=device, type=config.cache_type)
+        cache_kwargs = {"hicache_policy": self.hicache_policy} if self.enable_hicache else {}
+        self._prefix_cache = create_prefix_cache(
+            device=device, type=config.cache_type, **cache_kwargs
+        )
         if self.enable_hicache:
             from sgl.hicache import HiCacheController
 
@@ -32,6 +36,7 @@ class CacheManager:
                 num_pages,
                 config,
                 free_cuda_slots=lambda indices: self._free(indices),
+                hicache_policy=self.hicache_policy,
             )
             self.start_load_host = self._hicache_controller.start_load
             self.refresh_hicache = self._hicache_controller.refresh
@@ -183,3 +188,9 @@ def _write_page_table(
     table_idxs = table_idx_host.to(page_table.device, non_blocking=True)
     offsets = positions_host.to(page_table.device, non_blocking=True)
     page_table[table_idxs, offsets] = allocated
+
+
+def _resolve_hicache_policy(config: SchedulerConfig) -> str:
+    if config.hicache_policy == "lru" and config.hicache_quick_demotion:
+        return "slru"
+    return config.hicache_policy

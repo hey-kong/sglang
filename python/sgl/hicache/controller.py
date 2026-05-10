@@ -59,10 +59,10 @@ RESET_ACK_THRESHOLD = 512
 
 class HiCacheTransferMixin:
     def __init__(
-            self,
-            cuda_kv: List[torch.Tensor],
-            host_kv: List[torch.Tensor],
-            config: SchedulerConfig,
+        self,
+        cuda_kv: List[torch.Tensor],
+        host_kv: List[torch.Tensor],
+        config: SchedulerConfig,
     ) -> None:
         self.load_stream = torch.cuda.Stream()
         self.write_stream = torch.cuda.Stream()
@@ -119,17 +119,19 @@ class HiCacheTransferMixin:
         num_pages = len(host_indices) // self.page_size
 
         # fast path
-        if (int(host_indices[-1].item()) == int(host_indices[0].item()) + len(host_indices) - 1
-                and int(cuda_indices[-1].item()) == int(cuda_indices[0].item()) + len(cuda_indices) - 1):
+        if (
+            int(host_indices[-1].item()) == int(host_indices[0].item()) + len(host_indices) - 1
+            and int(cuda_indices[-1].item()) == int(cuda_indices[0].item()) + len(cuda_indices) - 1
+        ):
             host_page_start = int(host_indices[0].item()) // self.page_size
             cuda_page_start = int(cuda_indices[0].item()) // self.page_size
 
-            self._cuda_page[0][cuda_page_start:cuda_page_start + num_pages].copy_(
-                self._host_page[0][host_page_start:host_page_start + num_pages],
+            self._cuda_page[0][cuda_page_start : cuda_page_start + num_pages].copy_(
+                self._host_page[0][host_page_start : host_page_start + num_pages],
                 non_blocking=True,
             )
-            self._cuda_page[1][cuda_page_start:cuda_page_start + num_pages].copy_(
-                self._host_page[1][host_page_start:host_page_start + num_pages],
+            self._cuda_page[1][cuda_page_start : cuda_page_start + num_pages].copy_(
+                self._host_page[1][host_page_start : host_page_start + num_pages],
                 non_blocking=True,
             )
             return
@@ -165,11 +167,12 @@ class HiCacheTransferMixin:
 
 class HiCacheController(HiCacheTransferMixin):
     def __init__(
-            self,
-            prefix_cache: BasePrefixCache,
-            num_pages: int,
-            config: SchedulerConfig,
-            free_cuda_slots: Callable[[torch.Tensor], None],
+        self,
+        prefix_cache: BasePrefixCache,
+        num_pages: int,
+        config: SchedulerConfig,
+        free_cuda_slots: Callable[[torch.Tensor], None],
+        hicache_policy: str,
     ):
         self.hiradix_cache = cast("HiRadixPrefixCache", prefix_cache)
         self.free_cuda_slots = free_cuda_slots
@@ -182,7 +185,7 @@ class HiCacheController(HiCacheTransferMixin):
         self.cuda_pool = get_global_ctx().kv_cache
         self.num_layers = self.cuda_pool.num_layers
         self.use_layerwise = config.use_layerwise
-        self.hicache_quick_demotion = config.hicache_quick_demotion
+        self.hicache_quick_demotion = hicache_policy == "slru"
         self.pagewise_load = (
             config.device_mem_layout == "page_first"
             and config.host_mem_layout == "page_first"
@@ -193,11 +196,10 @@ class HiCacheController(HiCacheTransferMixin):
         self.token_bytes = self.cuda_pool.get_per_token_bytes()
         num_host_pages = int(num_pages * config.hicache_ratio)
         num_host_tokens = num_host_pages * config.page_size
-        total_bytes_gb = num_host_tokens * self.token_bytes / (1024 ** 3)
+        total_bytes_gb = num_host_tokens * self.token_bytes / (1024**3)
         self.free_slots = torch.arange(num_host_tokens, dtype=torch.int32, device="cpu")
         logger.info(
-            f"Allocating {num_host_tokens} tokens "
-            f"({total_bytes_gb:.2f} GB) for host memory pool"
+            f"Allocating {num_host_tokens} tokens ({total_bytes_gb:.2f} GB) for host memory pool"
         )
         self.host_pool = self.cuda_pool.create_host_pool(num_host_pages, config.host_mem_layout)
 
@@ -209,10 +211,10 @@ class HiCacheController(HiCacheTransferMixin):
         )
 
     def prepare_load(
-            self,
-            host_handle: BaseCacheHandle,
-            cuda_handle: BaseCacheHandle,
-            cuda_indices: torch.Tensor,
+        self,
+        host_handle: BaseCacheHandle,
+        cuda_handle: BaseCacheHandle,
+        cuda_indices: torch.Tensor,
     ) -> None:
         host_list = self.hiradix_cache.set_cuda(host_handle, cuda_indices)
         self.hiradix_cache.lock_handle(host_handle, unlock=False)
@@ -261,7 +263,9 @@ class HiCacheController(HiCacheTransferMixin):
         cuda_indices.record_stream(self.load_stream)
         self.load_queue.clear()
         ack_id = self._allocate_ack_id()
-        self.ack_load_queue.append(Ack(ack_id, [], [], num_tokens, counter.start_event, counter.finish_event))
+        self.ack_load_queue.append(
+            Ack(ack_id, [], [], num_tokens, counter.start_event, counter.finish_event)
+        )
         logger.info_rank0(f"HiCache Load  [{ack_id}]: {num_tokens:>5} tokens")
 
     def start_write(self) -> None:
@@ -285,7 +289,9 @@ class HiCacheController(HiCacheTransferMixin):
         cuda_indices.record_stream(self.write_stream)
         self.write_queue.clear()
         ack_id = self._allocate_ack_id()
-        self.ack_write_queue.append(Ack(ack_id, handles, demote_lens, num_tokens, start_event, finish_event))
+        self.ack_write_queue.append(
+            Ack(ack_id, handles, demote_lens, num_tokens, start_event, finish_event)
+        )
         logger.info_rank0(f"HiCache Write [{ack_id}]: {num_tokens:>5} tokens")
 
     def refresh(self, tp_cpu_group: torch.distributed.ProcessGroup) -> None:
@@ -361,7 +367,7 @@ class HiCacheController(HiCacheTransferMixin):
 
     def _log_transaction(self, ack: Ack, stage: str):
         dur = ack.start_event.elapsed_time(ack.finish_event)
-        bandwidth = (self.token_bytes * ack.num_tokens / (1024 ** 3)) / (dur / 1000)
+        bandwidth = (self.token_bytes * ack.num_tokens / (1024**3)) / (dur / 1000)
         logger.info(
             f"HiCache {stage} [{ack.ack_id}]: {ack.num_tokens:>5} tokens: "
             f"duration = {dur:>5.2f} ms, bandwidth = {bandwidth:>5.2f} GB/s"

@@ -230,7 +230,20 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         default=ServerArgs.hicache_quick_demotion,
         help=(
             "Enable quick demotion for HiCache. Newly-written KV blocks are demoted from HBM after "
-            "they are asynchronously copied to DRAM. They will be loaded back to HBM on access."
+            "they are asynchronously copied to DRAM. They will be loaded back to HBM on access. "
+            "Equivalent to --hicache-policy slru when --hicache-policy is not set."
+        ),
+    )
+
+    parser.add_argument(
+        "--hicache-policy",
+        type=str,
+        default=ServerArgs.hicache_policy,
+        choices=["lru", "slru", "fifo", "lfu"],
+        help=(
+            "HiCache eviction policy. Only used with --cache-type hiradix. lru keeps the current "
+            "non-demoting behavior, slru enables quick demotion, fifo preserves insertion timestamps "
+            "on hit, and lfu evicts the least frequently hit blocks."
         ),
     )
 
@@ -268,10 +281,19 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     # Parse arguments
+    explicit_hicache_policy = any(
+        arg == "--hicache-policy" or arg.startswith("--hicache-policy=") for arg in args
+    )
     kwargs = parser.parse_args(args).__dict__.copy()
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")
+    if kwargs["cache_type"] != "hiradix" and explicit_hicache_policy:
+        parser.error("--hicache-policy can only be used with --cache-type hiradix")
+    if explicit_hicache_policy:
+        kwargs["hicache_quick_demotion"] = kwargs["hicache_policy"] == "slru"
+    elif kwargs["hicache_quick_demotion"]:
+        kwargs["hicache_policy"] = "slru"
     if run_shell:
         kwargs["cuda_graph_max_bs"] = 1
         kwargs["max_running_req"] = 1
