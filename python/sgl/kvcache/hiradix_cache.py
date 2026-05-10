@@ -11,83 +11,12 @@ from sgl.core import get_global_ctx
 from sgl.utils import align_down, init_logger
 
 from .base import BaseCacheHandle, BasePrefixCache, InsertResult, MatchResult, SizeInfo
+from .linked_node import LinkedNode
 
 KEY_FN: TypeAlias = Callable[[torch.Tensor], Any]
 HICACHE_POLICY: TypeAlias = Literal["lru", "slru", "fifo", "lfu"]
 
 logger = init_logger(__name__)
-
-
-class Ghost:
-    def __init__(self, capacity: int):
-        self.capacity = capacity
-        self.queue: OrderedDict[Tuple[int, Optional[Tuple[int, ...]]], None] = OrderedDict()
-        self.index: dict[int, Set[Optional[Tuple[int, ...]]]] = {}
-
-    def put(self, key: int, value: Optional[List[int]] = None):
-        v: Optional[Tuple[int, ...]] = tuple(value) if value is not None else None
-        entry = (key, v)
-
-        if entry not in self.queue:
-            self.queue[entry] = None
-            if key not in self.index:
-                self.index[key] = set()
-            self.index[key].add(v)
-
-        while len(self.queue) > self.capacity:
-            old_entry, _ = self.queue.popitem(last=False)
-            old_k, old_v = old_entry
-            self.index[old_k].remove(old_v)
-            if not self.index[old_k]:
-                del self.index[old_k]
-
-    def remove(self, key: int, value: Optional[List[int]] = None):
-        if key not in self.index:
-            return
-
-        if value is None:
-            vals_to_remove = list(self.index[key])
-            for v in vals_to_remove:
-                entry = (key, v)
-                self.queue.pop(entry, None)
-            del self.index[key]
-            return
-
-        v_tuple = tuple(value)
-        entry = (key, v_tuple)
-
-        self.queue.pop(entry, None)
-
-        if v_tuple in self.index[key]:
-            self.index[key].remove(v_tuple)
-            if not self.index[key]:
-                del self.index[key]
-
-    def exists(self, key: int, value: Optional[List[int]] = None) -> bool:
-        if key not in self.index:
-            return False
-        v = tuple(value) if value is not None else None
-        return v in self.index[key]
-
-    def is_empty(self) -> bool:
-        return len(self.queue) == 0
-
-    def __contains__(self, key: int) -> bool:
-        return key in self.index
-
-    def __len__(self):
-        return len(self.queue)
-
-    def print_ghost(self):
-        if not self.queue:
-            print("Ghost contents: None")
-            return
-        print("Ghost contents (FIFO order):")
-        for k, v in self.queue.keys():
-            print(f"  ({k}, {list(v) if v is not None else None})")
-
-    def __repr__(self):
-        return f"{list(self.queue.keys())}"
 
 
 class HiRadixTreeNode:
@@ -98,6 +27,7 @@ class HiRadixTreeNode:
         self.children: Dict[Any, HiRadixTreeNode] = {}
         self._parent: HiRadixTreeNode | None = None
         self.ref_count: int = 0
+        self.linked_node: LinkedNode | None = None
         self.uuid = HiRadixTreeNode.counter
         HiRadixTreeNode.counter += 1
         self.timestamp = tic or time.monotonic_ns()
@@ -119,10 +49,10 @@ class HiRadixTreeNode:
         return self._cuda_value is None and self._host_value is not None
 
     def set_key_value(
-        self,
-        key: torch.Tensor,
-        cuda_value: torch.Tensor | None,
-        host_value: torch.Tensor | None = None,
+            self,
+            key: torch.Tensor,
+            cuda_value: torch.Tensor | None,
+            host_value: torch.Tensor | None = None,
     ) -> None:
         self._key = key
         self._cuda_value = cuda_value
@@ -220,6 +150,78 @@ class HiRadixTreeNode:
         return self.timestamp < other.timestamp
 
 
+class Ghost:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.queue: OrderedDict[Tuple[int, Optional[Tuple[int, ...]]], None] = OrderedDict()
+        self.index: dict[int, Set[Optional[Tuple[int, ...]]]] = {}
+
+    def put(self, key: int, value: Optional[List[int]] = None):
+        v: Optional[Tuple[int, ...]] = tuple(value) if value is not None else None
+        entry = (key, v)
+
+        if entry not in self.queue:
+            self.queue[entry] = None
+            if key not in self.index:
+                self.index[key] = set()
+            self.index[key].add(v)
+
+        while len(self.queue) > self.capacity:
+            old_entry, _ = self.queue.popitem(last=False)
+            old_k, old_v = old_entry
+            self.index[old_k].remove(old_v)
+            if not self.index[old_k]:
+                del self.index[old_k]
+
+    def remove(self, key: int, value: Optional[List[int]] = None):
+        if key not in self.index:
+            return
+
+        if value is None:
+            vals_to_remove = list(self.index[key])
+            for v in vals_to_remove:
+                entry = (key, v)
+                self.queue.pop(entry, None)
+            del self.index[key]
+            return
+
+        v_tuple = tuple(value)
+        entry = (key, v_tuple)
+
+        self.queue.pop(entry, None)
+
+        if v_tuple in self.index[key]:
+            self.index[key].remove(v_tuple)
+            if not self.index[key]:
+                del self.index[key]
+
+    def exists(self, key: int, value: Optional[List[int]] = None) -> bool:
+        if key not in self.index:
+            return False
+        v = tuple(value) if value is not None else None
+        return v in self.index[key]
+
+    def is_empty(self) -> bool:
+        return len(self.queue) == 0
+
+    def __contains__(self, key: int) -> bool:
+        return key in self.index
+
+    def __len__(self):
+        return len(self.queue)
+
+    def print_ghost(self):
+        if not self.queue:
+            print("Ghost contents: None")
+            return
+        print("Ghost contents (FIFO order):")
+        for k, v in self.queue.keys():
+            print(f"  ({k}, {list(v) if v is not None else None})")
+
+    def __repr__(self):
+        return f"{list(self.queue.keys())}"
+
+
 @dataclass(frozen=True)
 class HiRadixCacheHandle(BaseCacheHandle):
     node: HiRadixTreeNode
@@ -236,10 +238,10 @@ class HiRadixCacheHandle(BaseCacheHandle):
 
 class HiRadixPrefixCache(BasePrefixCache):
     def __init__(
-        self,
-        device: torch.device,
-        hicache_policy: HICACHE_POLICY = "lru",
-        ghost_capacity: int = 1024,
+            self,
+            device: torch.device,
+            hicache_policy: HICACHE_POLICY = "lru",
+            ghost_capacity: int = 1024,
     ):
         super().__init__()
         self.device = device
@@ -297,7 +299,7 @@ class HiRadixPrefixCache(BasePrefixCache):
         updated_indices = indices[cuda_prefix_len:host_prefix_len].clone()
         node = host_node
         while not node.is_root() and node.on_host_only():
-            node.cuda_value = updated_indices[-node.length :]
+            node.cuda_value = updated_indices[-node.length:]
             updated_indices = updated_indices[: -node.length]
             node = node.parent
         assert len(updated_indices) == 0
@@ -376,7 +378,7 @@ class HiRadixPrefixCache(BasePrefixCache):
         node = handle.node
         result: List[torch.Tensor] = []
         while not node.is_root() and node.on_cuda_only():
-            node.host_value = indices[-node.length :]
+            node.host_value = indices[-node.length:]
             indices = indices[: -node.length]
             result.append(node.cuda_value)
             node = node.parent
@@ -391,7 +393,7 @@ class HiRadixPrefixCache(BasePrefixCache):
         promoted_len = 0
         while not node.is_root() and node.on_host_only():
             assert node.ref_count == 0
-            node.cuda_value = indices[-node.length :]
+            node.cuda_value = indices[-node.length:]
             indices = indices[: -node.length]
             result.append(node.host_value)
             promoted_len += node.length
@@ -445,14 +447,14 @@ class HiRadixPrefixCache(BasePrefixCache):
         pass
 
     def _make_evict_candidate(
-        self, node: HiRadixTreeNode
+            self, node: HiRadixTreeNode
     ) -> Tuple[Tuple[int, ...], HiRadixTreeNode]:
         if self.hicache_policy == "lfu":
             return (node.freq, node.timestamp, node.uuid), node
         return (node.timestamp, node.uuid), node
 
     def _collect_leave_nodes_for_evict(
-        self, is_host: bool
+            self, is_host: bool
     ) -> List[Tuple[Tuple[int, ...], HiRadixTreeNode]]:
         nodes: List[HiRadixTreeNode] = list(self.root_node.children.values())
         leave_nodes: List[Tuple[Tuple[int, ...], HiRadixTreeNode]] = []
