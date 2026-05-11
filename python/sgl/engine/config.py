@@ -22,14 +22,14 @@ class EngineConfig:
     moe_backend: str = "auto"
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
-    page_size: int = 1
+    page_size: int = 16
     memory_ratio: float = 0.9
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
-    device_mem_layout: str = "layer_first"
+    device_mem_layout: str = "page_first"
 
     @cached_property
     def hf_config(self):

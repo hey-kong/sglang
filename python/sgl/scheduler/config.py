@@ -19,8 +19,8 @@ class SchedulerConfig(EngineConfig):
     hicache_ratio: float = 2.0
     hicache_quick_demotion: bool = False
     hicache_policy: str = "lru"
-    host_mem_layout: str = "layer_first"
-    use_layerwise: bool = True
+    host_mem_layout: str = "page_first"
+    use_layerwise: bool = False
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)

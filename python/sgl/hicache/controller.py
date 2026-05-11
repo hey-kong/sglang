@@ -19,7 +19,7 @@ logger = init_logger(__name__)
 @dataclass
 class HiCacheCounter:
     num_layers: int
-    use_layerwise: bool = True
+    use_layerwise: bool = False
     start_event: torch.Event = field(init=False)
     finish_event: torch.Event = field(init=False)
     events: List[torch.Event] = field(init=False)
