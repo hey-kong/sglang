@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import sgl.core as core
 import torch
-from sgl.kvcache.hiradix_cache import HiRadixPrefixCache
+from sgl.kvcache.hiradix_cache import HiRadixPrefixCache, _prefix_hash_from_ids
 
 
 @pytest.fixture(autouse=True)
@@ -62,9 +62,9 @@ def test_node_prefix_hash_tracks_full_prefix_ids_after_split():
     )
 
     prefix_node = cache.root_node.children[1]
-    assert prefix_node.prefix_hash == hash((1, 2))
-    assert prefix_node.children[3].prefix_hash == hash((1, 2, 3))
-    assert prefix_node.children[4].prefix_hash == hash((1, 2, 4))
+    assert prefix_node.prefix_hash == _prefix_hash_from_ids([1, 2])
+    assert prefix_node.children[3].prefix_hash == _prefix_hash_from_ids([1, 2, 3])
+    assert prefix_node.children[4].prefix_hash == _prefix_hash_from_ids([1, 2, 4])
 
 
 def test_host_eviction_records_prefix_hash_in_ghost():
@@ -79,4 +79,4 @@ def test_host_eviction_records_prefix_hash_in_ghost():
     evicted_host_indices = cache.try_evict_host(1)
 
     assert [indices.tolist() for indices in evicted_host_indices] == [[177]]
-    assert cache.ghost.exists(hash((7,)))
+    assert cache.ghost.exists(_prefix_hash_from_ids([7]))

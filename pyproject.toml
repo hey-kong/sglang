@@ -30,6 +30,7 @@ dependencies = [
     "flashinfer-python>=0.5.3",
     "pyzmq",
     "uvicorn",
+    "xxhash",
     "fastapi",
     "prompt_toolkit",
     "openai",

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple, TypeAlias
 
 import torch
+import xxhash
 from sgl.core import get_global_ctx
 from sgl.utils import align_down, init_logger
 
@@ -17,6 +18,13 @@ KEY_FN: TypeAlias = Callable[[torch.Tensor], Any]
 HICACHE_POLICY: TypeAlias = Literal["lru", "slru", "fifo", "lfu"]
 
 logger = init_logger(__name__)
+
+
+def _prefix_hash_from_ids(prefix_ids: List[int]) -> int:
+    hasher = xxhash.xxh64()
+    for token_id in prefix_ids:
+        hasher.update(int(token_id).to_bytes(8, byteorder="little", signed=True))
+    return hasher.intdigest()
 
 
 class HiRadixTreeNode:
@@ -32,9 +40,8 @@ class HiRadixTreeNode:
         HiRadixTreeNode.counter += 1
         self.timestamp = tic or time.monotonic_ns()
         self.freq = 0
-        # Hash of all token ids on the path from the root through this node.
-        # It is equivalent to hash(tuple(prefix_ids + current_node_ids)).
-        self.prefix_hash = hash(())
+        # xxHash of all token ids on the path from the root through this node.
+        self.prefix_hash = _prefix_hash_from_ids([])
 
         # these fields should be updated later
         self._key: torch.Tensor
@@ -49,10 +56,10 @@ class HiRadixTreeNode:
         return self._cuda_value is None and self._host_value is not None
 
     def set_key_value(
-            self,
-            key: torch.Tensor,
-            cuda_value: torch.Tensor | None,
-            host_value: torch.Tensor | None = None,
+        self,
+        key: torch.Tensor,
+        cuda_value: torch.Tensor | None,
+        host_value: torch.Tensor | None = None,
     ) -> None:
         self._key = key
         self._cuda_value = cuda_value
@@ -76,7 +83,7 @@ class HiRadixTreeNode:
         prefix_ids: List[int] = []
         for part in parts:
             prefix_ids.extend(part.tolist())
-        return hash(tuple(prefix_ids))
+        return _prefix_hash_from_ids(prefix_ids)
 
     @property
     def length(self) -> int:
@@ -238,10 +245,10 @@ class HiRadixCacheHandle(BaseCacheHandle):
 
 class HiRadixPrefixCache(BasePrefixCache):
     def __init__(
-            self,
-            device: torch.device,
-            hicache_policy: HICACHE_POLICY = "lru",
-            ghost_capacity: int = 1024,
+        self,
+        device: torch.device,
+        hicache_policy: HICACHE_POLICY = "lru",
+        ghost_capacity: int = 1024,
     ):
         super().__init__()
         self.device = device
@@ -299,7 +306,7 @@ class HiRadixPrefixCache(BasePrefixCache):
         updated_indices = indices[cuda_prefix_len:host_prefix_len].clone()
         node = host_node
         while not node.is_root() and node.on_host_only():
-            node.cuda_value = updated_indices[-node.length:]
+            node.cuda_value = updated_indices[-node.length :]
             updated_indices = updated_indices[: -node.length]
             node = node.parent
         assert len(updated_indices) == 0
@@ -314,9 +321,9 @@ class HiRadixPrefixCache(BasePrefixCache):
     def evict(self, size: int) -> torch.Tensor:
         if size == 0:
             return self.empty_tensor
-        assert size <= self.evictable_size, (
-            f"Cannot evict {size}, only {self.evictable_size} is evictable"
-        )
+        assert (
+            size <= self.evictable_size
+        ), f"Cannot evict {size}, only {self.evictable_size} is evictable"
 
         leave_nodes = self._collect_leave_nodes_for_evict(is_host=False)
         heapq.heapify(leave_nodes)
@@ -378,7 +385,7 @@ class HiRadixPrefixCache(BasePrefixCache):
         node = handle.node
         result: List[torch.Tensor] = []
         while not node.is_root() and node.on_cuda_only():
-            node.host_value = indices[-node.length:]
+            node.host_value = indices[-node.length :]
             indices = indices[: -node.length]
             result.append(node.cuda_value)
             node = node.parent
@@ -393,7 +400,7 @@ class HiRadixPrefixCache(BasePrefixCache):
         promoted_len = 0
         while not node.is_root() and node.on_host_only():
             assert node.ref_count == 0
-            node.cuda_value = indices[-node.length:]
+            node.cuda_value = indices[-node.length :]
             indices = indices[: -node.length]
             result.append(node.host_value)
             promoted_len += node.length
@@ -447,14 +454,14 @@ class HiRadixPrefixCache(BasePrefixCache):
         pass
 
     def _make_evict_candidate(
-            self, node: HiRadixTreeNode
+        self, node: HiRadixTreeNode
     ) -> Tuple[Tuple[int, ...], HiRadixTreeNode]:
         if self.hicache_policy == "lfu":
             return (node.freq, node.timestamp, node.uuid), node
         return (node.timestamp, node.uuid), node
 
     def _collect_leave_nodes_for_evict(
-            self, is_host: bool
+        self, is_host: bool
     ) -> List[Tuple[Tuple[int, ...], HiRadixTreeNode]]:
         nodes: List[HiRadixTreeNode] = list(self.root_node.children.values())
         leave_nodes: List[Tuple[Tuple[int, ...], HiRadixTreeNode]] = []
