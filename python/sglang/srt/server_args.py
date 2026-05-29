@@ -668,6 +668,10 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
+    contextide: bool = False
+    main_page_size: int = 256
+    main_size_ratio: float = 0.75
+    ghost_size_ratio: float = 1.0
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -4277,6 +4281,25 @@ class ServerArgs:
             envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
+        if self.contextide:
+            self.enable_hierarchical_cache = True
+            self.hicache_write_policy = "write_through"
+            if self.main_page_size <= 0:
+                raise ValueError("--main-page-size must be positive.")
+            if self.page_size is not None and self.main_page_size % self.page_size != 0:
+                raise ValueError(
+                    f"--main-page-size ({self.main_page_size}) must be a multiple of "
+                    f"--page-size ({self.page_size})."
+                )
+            if not (0.0 < self.main_size_ratio < 1.0):
+                raise ValueError("--main-size-ratio must be in range (0, 1).")
+            if self.ghost_size_ratio <= 0.0:
+                raise ValueError("--ghost-size-ratio must be positive.")
+            if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
+                raise ValueError("--contextide is not compatible with the C++ radix tree.")
+            if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+                raise ValueError("--contextide is not compatible with the unified radix tree.")
+
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
@@ -6301,6 +6324,29 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
+        )
+        parser.add_argument(
+            "--contextide",
+            action="store_true",
+            help="Enable ContextIDe hierarchical cache mode. This implies --enable-hierarchical-cache and ignores --hicache-write-policy.",
+        )
+        parser.add_argument(
+            "--main-page-size",
+            type=int,
+            default=ServerArgs.main_page_size,
+            help="ContextIDe main FIFO promotion granularity in tokens. Must be a multiple of --page-size.",
+        )
+        parser.add_argument(
+            "--main-size-ratio",
+            type=float,
+            default=ServerArgs.main_size_ratio,
+            help="ContextIDe fraction of HiCache host capacity reserved for the main FIFO.",
+        )
+        parser.add_argument(
+            "--ghost-size-ratio",
+            type=float,
+            default=ServerArgs.ghost_size_ratio,
+            help="ContextIDe ghost FIFO size ratio relative to HiCache host capacity.",
         )
 
         # Hierarchical sparse attention
