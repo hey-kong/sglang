@@ -924,6 +924,14 @@ class Scheduler(
                     self.tree_cache = HiMambaRadixCache(
                         params=params, server_args=server_args
                     )
+                elif server_args.contextide:
+                    from sglang.srt.mem_cache.contextide_cache import (
+                        ContextIDeHiRadixCache,
+                    )
+
+                    self.tree_cache = ContextIDeHiRadixCache(
+                        params=params, server_args=server_args
+                    )
                 else:
                     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 
