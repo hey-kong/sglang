@@ -361,6 +361,28 @@ class ContextIDeHiRadixCache(HiRadixCache):
             self._mark_small(child)
         return new_node
 
+    def dec_lock_ref(self, node: TreeNode, params=None):
+        result = super().dec_lock_ref(node, params)
+        cur = node
+        while cur != self.root_node:
+            self._mark_hbm(cur)
+            cur = cur.parent
+        return result
+
+    def _evict_backuped(self, node: TreeNode):
+        self.hbm_lru.remove(node)
+        num_evicted = super()._evict_backuped(node)
+        if node.parent is not None:
+            self._mark_hbm(node.parent)
+        return num_evicted
+
+    def _evict_regular(self, node: TreeNode):
+        self._remove_node_from_lists(node)
+        num_evicted = super()._evict_regular(node)
+        if node.parent is not None:
+            self._mark_hbm(node.parent)
+        return num_evicted
+
     def _insert_helper_host(self, node: TreeNode, key: RadixKey, host_value, hash_value):
         node.last_access_time = time.monotonic()
         matched_length = 0
@@ -476,7 +498,10 @@ class ContextIDeHiRadixCache(HiRadixCache):
                     num_evicted += self._evict_backuped(node)
                 else:
                     num_evicted += self._evict_regular(node)
-            if len(node.parent.children) == 0:
-                self._mark_hbm(node.parent)
+
+        if num_evicted < num_tokens:
+            fallback = super().evict(EvictParams(num_tokens=num_tokens - num_evicted))
+            num_evicted += fallback.num_tokens_evicted
+
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
