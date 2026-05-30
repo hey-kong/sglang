@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import logging
 import time
 from collections import OrderedDict
@@ -200,9 +201,11 @@ class ContextIDeHiRadixCache(HiRadixCache):
         if ghost:
             self._add_ghost(self._node_hash_key(node))
         self._remove_node_from_lists(node)
+        self.evictable_host_leaves.discard(node)
         self._record_remove_event(node, medium=StorageMedium.CPU)
-        self.cache_controller.evict_host(node.host_value)
+        host_value = node.host_value
         node.host_value = None
+        self.cache_controller.evict_host(host_value)
         # Host-only leaf with no device value can be deleted from the radix tree.
         key = node.key.child_key(self.page_size)
         node.parent.children.pop(key, None)
@@ -235,11 +238,63 @@ class ContextIDeHiRadixCache(HiRadixCache):
                 self.main_freq.pop(node.id, None)
                 self.node_tier.pop(node.id, None)
 
-        if evicted_pages * self.page_size < num_tokens:
-            # Fall back to HiRadix's host-leaf heap for pages that are not in the
-            # ContextIDe metadata lists (e.g. pages created before list metadata).
-            super().evict_host(num_tokens - evicted_pages * self.page_size)
+        remaining_tokens = num_tokens - evicted_pages * self.page_size
+        if remaining_tokens > 0:
+            self._evict_host_fallback(remaining_tokens)
 
+    def _evict_host_fallback(self, num_tokens: int) -> int:
+        """Evict host pages from HiRadix metadata without freeing stale nodes."""
+        leaves = [
+            node
+            for node in self.evictable_host_leaves
+            if node.host_value is not None
+        ]
+        eviction_heap = [
+            (self.eviction_strategy.get_priority(node), node) for node in leaves
+        ]
+        heapq.heapify(eviction_heap)
+
+        num_evicted = 0
+        while num_evicted < num_tokens and eviction_heap:
+            _priority, node = heapq.heappop(eviction_heap)
+            if (
+                node == self.root_node
+                or node.host_value is None
+                or not node.evicted
+                or node.host_ref_counter > 0
+                or len(node.children) > 0
+            ):
+                self.evictable_host_leaves.discard(node)
+                continue
+
+            self._remove_node_from_lists(node)
+            self.evictable_host_leaves.discard(node)
+            self._record_remove_event(node, medium=StorageMedium.CPU)
+            host_value = node.host_value
+            node.host_value = None
+            num_evicted += self.cache_controller.evict_host(host_value)
+
+            parent = node.parent
+            key = node.key.child_key(self.page_size)
+            value = parent.children.pop(key, None) if parent is not None else None
+            if value is not node:
+                logger.debug(
+                    "Skip stale ContextIDe host leaf removal for node %s.",
+                    node.id,
+                )
+                continue
+            self._update_host_leaf_status(parent)
+            self._update_leaf_status(parent)
+
+            if parent is not None and len(parent.children) == 0 and parent.evicted:
+                self._mark_hbm(parent)
+                if parent.host_value is not None:
+                    heapq.heappush(
+                        eviction_heap,
+                        (self.eviction_strategy.get_priority(parent), parent),
+                    )
+
+        return num_evicted
 
     def _add_ghost(self, key: str) -> None:
         self.ghost_fifo.pop(key, None)
