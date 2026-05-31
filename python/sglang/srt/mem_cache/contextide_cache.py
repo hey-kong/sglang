@@ -617,6 +617,36 @@ class ContextIDeHiRadixCache(HiRadixCache):
             finish_count -= 1
         self._retry_pending_write_through()
 
+    def _evict_hbm_subtree(self, node: TreeNode) -> tuple[int, bool]:
+        """Evict an HBM subtree in leaf-first order without writing to DRAM.
+
+        A DRAM-backed radix node may still have radix children after its HBM copy
+        is released.  For HBM eviction purposes it is a leaf only after every HBM
+        page below it has been released.  If any page in the subtree is locked,
+        keep the ancestors resident so eviction never removes a non-leaf HBM page.
+        """
+        if node.lock_ref > 0:
+            return 0, False
+
+        num_evicted = 0
+        for child in list(node.children.values()):
+            child_evicted, child_subtree_evicted = self._evict_hbm_subtree(child)
+            num_evicted += child_evicted
+            if not child_subtree_evicted:
+                return num_evicted, False
+
+        if node.value is None:
+            return num_evicted, True
+        if node.backuped:
+            return num_evicted + self._evict_backuped(node), True
+        if len(node.children) == 0:
+            return num_evicted + self._evict_regular(node), True
+
+        # An unbacked radix node can be deleted only after all of its children
+        # have been removed from the tree. Host-only children intentionally stay
+        # in the radix tree, so keep this node resident instead of demoting it.
+        return num_evicted, False
+
     def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
@@ -626,22 +656,17 @@ class ContextIDeHiRadixCache(HiRadixCache):
             node = self.hbm_lru.pop_tail()
             if node is None:
                 break
-            if node.value is None or node.lock_ref > 0:
+            if node.value is None:
                 continue
-            if node.backuped:
-                # Backed-up internal prefix pages can release only their HBM copy
-                # while remaining in the radix tree with their DRAM copy intact.
-                num_evicted += self._evict_backuped(node)
-            elif len(node.children) > 0:
-                # Unbacked internal pages cannot be deleted without deleting their
-                # suffix. Keep them in HBM until their children are removed.
+            subtree_evicted, fully_evicted = self._evict_hbm_subtree(node)
+            num_evicted += subtree_evicted
+            if not fully_evicted:
+                # Locked descendants and unbacked internal nodes cannot be
+                # released safely. Keep the candidate in HBM and inspect another
+                # LRU entry instead.
                 self.hbm_lru.add_head(node)
                 blocked_pages += 1
                 continue
-            else:
-                # HBM eviction never writes a new DRAM backup. Unbacked leaves
-                # are dropped directly instead of being demoted to host memory.
-                num_evicted += self._evict_regular(node)
             blocked_pages = 0
 
         self.update_eviction_metrics(num_evicted, start_time)
