@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import heapq
 import logging
 import time
 from collections import OrderedDict
@@ -96,7 +95,9 @@ class ContextIDeHiRadixCache(HiRadixCache):
 
         host_token_capacity = self.cache_controller.mem_pool_host.size
         host_page_capacity = max(1, host_token_capacity // self.page_size)
-        self.main_capacity_pages = max(1, int(host_page_capacity * self.main_size_ratio))
+        self.main_capacity_pages = max(
+            1, int(host_page_capacity * self.main_size_ratio)
+        )
         self.small_capacity_pages = max(
             1, host_page_capacity - self.main_capacity_pages
         )
@@ -111,6 +112,7 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self.main_freq: dict[int, int] = {}
         self.node_tier: dict[int, str] = {}
         self._contextide_demote_after_write: set[int] = set()
+        self._pending_write_through: OrderedDict[int, TreeNode] = OrderedDict()
 
         logger.info(
             "ContextIDe HiCache enabled: page_size=%d main_page_size=%d "
@@ -122,14 +124,47 @@ class ContextIDeHiRadixCache(HiRadixCache):
             self.ghost_capacity_pages,
         )
 
+    def attach_storage_backend(
+        self,
+        storage_backend: str,
+        storage_backend_extra_config_json: Optional[str] = None,
+        served_model_name: Optional[str] = None,
+        hicache_storage_prefetch_policy: Optional[str] = None,
+        hicache_write_policy: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        # ContextIDe semantics are always write-through, including runtime storage
+        # attachment requests that attempt to update the generic HiCache policy.
+        return super().attach_storage_backend(
+            storage_backend=storage_backend,
+            storage_backend_extra_config_json=storage_backend_extra_config_json,
+            served_model_name=served_model_name,
+            hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
+            hicache_write_policy="write_through",
+        )
+
+    def _ensure_write_through(self, node: TreeNode) -> None:
+        if node.backuped or node.value is None:
+            self._pending_write_through.pop(node.id, None)
+            return
+        written = self.write_backup(node)
+        if written > 0:
+            self._pending_write_through.pop(node.id, None)
+            self._contextide_demote_after_write.add(node.id)
+        else:
+            # A write can be temporarily blocked by an unfinished parent-prefix
+            # write or host pressure. Retry after the next write acknowledgement.
+            self._pending_write_through[node.id] = node
+
+    def _retry_pending_write_through(self) -> None:
+        for node in list(self._pending_write_through.values()):
+            self._ensure_write_through(node)
+
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         if chunked:
             return
         node.hit_count += 1
-        if not node.backuped and node.hit_count >= self.write_through_threshold:
-            written = self.write_backup(node)
-            if written > 0:
-                self._contextide_demote_after_write.add(node.id)
+        if node.hit_count >= self.write_through_threshold:
+            self._ensure_write_through(node)
 
     def _node_hash_key(self, node: TreeNode) -> str:
         if node.hash_value:
@@ -144,6 +179,8 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self.main_fifo.remove(node)
         self.main_freq.pop(node.id, None)
         self.node_tier.pop(node.id, None)
+        self._pending_write_through.pop(node.id, None)
+        self._contextide_demote_after_write.discard(node.id)
 
     def _mark_hbm(self, node: TreeNode) -> None:
         if node.value is not None and node.lock_ref == 0:
@@ -216,14 +253,20 @@ class ContextIDeHiRadixCache(HiRadixCache):
     def evict_host(self, num_tokens: int):
         target_pages = max(1, (num_tokens + self.page_size - 1) // self.page_size)
         evicted_pages = 0
-        while evicted_pages < target_pages:
+        blocked_pages = 0
+        while evicted_pages < target_pages and blocked_pages < len(self.small_fifo):
             node = self.small_fifo.pop_tail()
             if node is None:
                 break
             if self._evict_host_node(node, ghost=True):
                 evicted_pages += 1
+                blocked_pages = 0
+            else:
+                self.small_fifo.add_head(node)
+                blocked_pages += 1
 
-        while evicted_pages < target_pages:
+        blocked_pages = 0
+        while evicted_pages < target_pages and blocked_pages < len(self.main_fifo):
             node = self.main_fifo.pop_tail()
             if node is None:
                 break
@@ -231,70 +274,14 @@ class ContextIDeHiRadixCache(HiRadixCache):
             if freq > 0:
                 self.main_freq[node.id] = freq - 1
                 self.main_fifo.add_head(node)
+                blocked_pages = 0
                 continue
             if self._evict_host_node(node, ghost=False):
                 evicted_pages += 1
+                blocked_pages = 0
             else:
-                self.main_freq.pop(node.id, None)
-                self.node_tier.pop(node.id, None)
-
-        remaining_tokens = num_tokens - evicted_pages * self.page_size
-        if remaining_tokens > 0:
-            self._evict_host_fallback(remaining_tokens)
-
-    def _evict_host_fallback(self, num_tokens: int) -> int:
-        """Evict host pages from HiRadix metadata without freeing stale nodes."""
-        leaves = [
-            node
-            for node in self.evictable_host_leaves
-            if node.host_value is not None
-        ]
-        eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
-        ]
-        heapq.heapify(eviction_heap)
-
-        num_evicted = 0
-        while num_evicted < num_tokens and eviction_heap:
-            _priority, node = heapq.heappop(eviction_heap)
-            if (
-                node == self.root_node
-                or node.host_value is None
-                or not node.evicted
-                or node.host_ref_counter > 0
-                or len(node.children) > 0
-            ):
-                self.evictable_host_leaves.discard(node)
-                continue
-
-            self._remove_node_from_lists(node)
-            self.evictable_host_leaves.discard(node)
-            self._record_remove_event(node, medium=StorageMedium.CPU)
-            host_value = node.host_value
-            node.host_value = None
-            num_evicted += self.cache_controller.evict_host(host_value)
-
-            parent = node.parent
-            key = node.key.child_key(self.page_size)
-            value = parent.children.pop(key, None) if parent is not None else None
-            if value is not node:
-                logger.debug(
-                    "Skip stale ContextIDe host leaf removal for node %s.",
-                    node.id,
-                )
-                continue
-            self._update_host_leaf_status(parent)
-            self._update_leaf_status(parent)
-
-            if parent is not None and len(parent.children) == 0 and parent.evicted:
-                self._mark_hbm(parent)
-                if parent.host_value is not None:
-                    heapq.heappush(
-                        eviction_heap,
-                        (self.eviction_strategy.get_priority(parent), parent),
-                    )
-
-        return num_evicted
+                self.main_fifo.add_head(node)
+                blocked_pages += 1
 
     def _add_ghost(self, key: str) -> None:
         self.ghost_fifo.pop(key, None)
@@ -304,17 +291,24 @@ class ContextIDeHiRadixCache(HiRadixCache):
             self.ghost_fifo.popitem(last=True)
 
     def _evict_small_fifo_if_needed(self) -> None:
+        blocked_pages = 0
         while len(self.small_fifo) > self.small_capacity_pages:
             node = self.small_fifo.pop_tail()
             if node is None:
                 break
-            if not self._evict_host_node(node, ghost=True):
-                # Non-leaf or still referenced pages cannot be physically removed.
-                # Keep metadata out of small FIFO; the radix invariants are safer
-                # than forcing an internal host tombstone.
+            if self._evict_host_node(node, ghost=True):
+                blocked_pages = 0
                 continue
 
+            # Internal or referenced radix nodes cannot be physically removed yet.
+            # Keep them tracked and inspect the next-oldest candidate instead.
+            self.small_fifo.add_head(node)
+            blocked_pages += 1
+            if blocked_pages >= len(self.small_fifo):
+                break
+
     def _evict_main_fifo_if_needed(self) -> None:
+        blocked_pages = 0
         while len(self.main_fifo) > self.main_capacity_pages:
             node = self.main_fifo.pop_tail()
             if node is None:
@@ -323,11 +317,17 @@ class ContextIDeHiRadixCache(HiRadixCache):
             if freq > 0:
                 self.main_freq[node.id] = freq - 1
                 self.main_fifo.add_head(node)
-                break
-            if not self._evict_host_node(node, ghost=False):
-                self.main_freq.pop(node.id, None)
-                self.node_tier.pop(node.id, None)
+                blocked_pages = 0
                 continue
+            if self._evict_host_node(node, ghost=False):
+                blocked_pages = 0
+                continue
+
+            # Preserve metadata for radix nodes that cannot be removed yet.
+            self.main_fifo.add_head(node)
+            blocked_pages += 1
+            if blocked_pages >= len(self.main_fifo):
+                break
 
     def _add_page_node(
         self,
@@ -349,7 +349,11 @@ class ContextIDeHiRadixCache(HiRadixCache):
         if self.enable_storage or self.enable_kv_cache_events:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
         self._record_store_event(new_node)
-        self._inc_hit_count(new_node, chunked)
+        # Every newly created ContextIDe page is written through, including pages
+        # produced by chunked prefill. Hit counting remains disabled for chunks.
+        self._ensure_write_through(new_node)
+        if not chunked:
+            new_node.hit_count += 1
         self._mark_hbm(new_node)
         return new_node
 
@@ -397,7 +401,9 @@ class ContextIDeHiRadixCache(HiRadixCache):
                 total_prefix_length += len(page_key)
                 node = child
             else:
-                node = self._add_page_node(node, page_key, page_value, priority, chunked)
+                node = self._add_page_node(
+                    node, page_key, page_value, priority, chunked
+                )
             remaining_key = remaining_key[self.page_size :]
             remaining_value = remaining_value[self.page_size :]
 
@@ -420,8 +426,19 @@ class ContextIDeHiRadixCache(HiRadixCache):
         result = super().dec_lock_ref(node, params)
         cur = node
         while cur != self.root_node:
-            self._mark_hbm(cur)
+            if (
+                self.node_tier.get(cur.id) == "main"
+                and cur.backuped
+                and cur.value is not None
+                and cur.lock_ref == 0
+            ):
+                # Main FIFO pages are DRAM-resident after the active request. Only
+                # the non-main tail of a host hit is allowed to remain in HBM LRU.
+                self._evict_backuped(cur)
+            else:
+                self._mark_hbm(cur)
             cur = cur.parent
+        self._retry_pending_write_through()
         return result
 
     def _evict_backuped(self, node: TreeNode):
@@ -429,6 +446,10 @@ class ContextIDeHiRadixCache(HiRadixCache):
         num_evicted = super()._evict_backuped(node)
         if node.parent is not None:
             self._mark_hbm(node.parent)
+        if self.node_tier.get(node.id) == "small":
+            self._evict_small_fifo_if_needed()
+        elif self.node_tier.get(node.id) == "main":
+            self._evict_main_fifo_if_needed()
         return num_evicted
 
     def _evict_regular(self, node: TreeNode):
@@ -438,7 +459,9 @@ class ContextIDeHiRadixCache(HiRadixCache):
             self._mark_hbm(node.parent)
         return num_evicted
 
-    def _insert_helper_host(self, node: TreeNode, key: RadixKey, host_value, hash_value):
+    def _insert_helper_host(
+        self, node: TreeNode, key: RadixKey, host_value, hash_value
+    ):
         node.last_access_time = time.monotonic()
         matched_length = 0
         remaining_key = key
@@ -501,12 +524,22 @@ class ContextIDeHiRadixCache(HiRadixCache):
                 cur = cur.parent
         return values, node
 
-    def writing_check(self, write_back: bool = False):
-        if write_back:
-            return super().writing_check(write_back=True)
+    def _complete_write(self, backuped_node: TreeNode) -> None:
+        self._record_store_event(backuped_node, medium=StorageMedium.CPU)
+        self.dec_lock_ref(backuped_node)
+        self._mark_small(backuped_node)
+        if backuped_node.id in self._contextide_demote_after_write:
+            self._contextide_demote_after_write.discard(backuped_node.id)
+            if backuped_node.value is not None and backuped_node.lock_ref == 0:
+                self._evict_backuped(backuped_node)
+        if self.enable_storage:
+            self.write_backup_storage(backuped_node)
 
+    def writing_check(self, write_back: bool = False):
         if len(self.ongoing_write_through) == 0:
-            return
+            self._retry_pending_write_through()
+            if len(self.ongoing_write_through) == 0:
+                return
 
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
@@ -522,41 +555,37 @@ class ContextIDeHiRadixCache(HiRadixCache):
             finish_event.synchronize()
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
-                self._record_store_event(backuped_node, medium=StorageMedium.CPU)
-                self.dec_lock_ref(backuped_node)
-                self._mark_small(backuped_node)
-                if backuped_node.id in self._contextide_demote_after_write:
-                    self._contextide_demote_after_write.discard(backuped_node.id)
-                    if backuped_node.value is not None and backuped_node.lock_ref == 0:
-                        self._evict_backuped(backuped_node)
-                        self.hbm_lru.remove(backuped_node)
-                if self.enable_storage:
-                    self.write_backup_storage(backuped_node)
+                self._complete_write(backuped_node)
             finish_count -= 1
+        self._retry_pending_write_through()
 
     def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
         num_evicted = 0
-        while num_evicted < num_tokens:
+        blocked_pages = 0
+        while num_evicted < num_tokens and blocked_pages < len(self.hbm_lru):
             node = self.hbm_lru.pop_tail()
             if node is None:
                 break
-            if node.value is None or node.lock_ref > 0 or len(node.children) > 0:
+            if node.value is None or node.lock_ref > 0:
                 continue
             if node.backuped:
                 num_evicted += self._evict_backuped(node)
-            else:
-                written = self.write_backup(node, write_back=True)
-                if written > 0:
-                    self.writing_check(write_back=True)
-                    num_evicted += self._evict_backuped(node)
-                else:
-                    num_evicted += self._evict_regular(node)
+                blocked_pages = 0
+                continue
 
-        if num_evicted < num_tokens:
-            fallback = super().evict(EvictParams(num_tokens=num_tokens - num_evicted))
-            num_evicted += fallback.num_tokens_evicted
+            if len(node.children) == 0:
+                # HBM eviction never writes a new DRAM backup. Pages without an
+                # existing host copy are dropped directly when safe to delete.
+                num_evicted += self._evict_regular(node)
+                blocked_pages = 0
+            else:
+                # An unbacked internal radix page cannot be deleted without its
+                # subtree. Keep it in HBM LRU until it becomes a leaf or its
+                # normal write-through copy completes.
+                self.hbm_lru.add_head(node)
+                blocked_pages += 1
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
