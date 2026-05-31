@@ -112,7 +112,6 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self.main_freq: dict[int, int] = {}
         self.node_tier: dict[int, str] = {}
         self._contextide_demote_after_write: set[int] = set()
-        self._contextide_write_back: set[int] = set()
         self._pending_write_through: OrderedDict[int, TreeNode] = OrderedDict()
 
         logger.info(
@@ -142,12 +141,6 @@ class ContextIDeHiRadixCache(HiRadixCache):
             hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
             hicache_write_policy="write_through",
         )
-
-    def write_backup(self, node: TreeNode, write_back: bool = False) -> int:
-        written = super().write_backup(node, write_back=write_back)
-        if written > 0 and write_back:
-            self._contextide_write_back.add(node.id)
-        return written
 
     def _ensure_write_through(self, node: TreeNode) -> None:
         if node.backuped or node.value is None:
@@ -188,7 +181,6 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self.node_tier.pop(node.id, None)
         self._pending_write_through.pop(node.id, None)
         self._contextide_demote_after_write.discard(node.id)
-        self._contextide_write_back.discard(node.id)
 
     def _mark_hbm(self, node: TreeNode) -> None:
         if node.value is not None and node.lock_ref == 0:
@@ -533,11 +525,8 @@ class ContextIDeHiRadixCache(HiRadixCache):
         return values, node
 
     def _complete_write(self, backuped_node: TreeNode) -> None:
-        is_write_back = backuped_node.id in self._contextide_write_back
-        self._contextide_write_back.discard(backuped_node.id)
         self._record_store_event(backuped_node, medium=StorageMedium.CPU)
-        if not is_write_back:
-            self.dec_lock_ref(backuped_node)
+        self.dec_lock_ref(backuped_node)
         self._mark_small(backuped_node)
         if backuped_node.id in self._contextide_demote_after_write:
             self._contextide_demote_after_write.discard(backuped_node.id)
@@ -551,19 +540,6 @@ class ContextIDeHiRadixCache(HiRadixCache):
             self._retry_pending_write_through()
             if len(self.ongoing_write_through) == 0:
                 return
-
-        if write_back:
-            # A forced HBM eviction waits for all queued writes. Processing the
-            # acknowledgements here also keeps write-back pages in the small FIFO.
-            while len(self.ongoing_write_through) > 0:
-                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                    finish_event.synchronize()
-                    for ack_id in ack_list:
-                        backuped_node = self.ongoing_write_through.pop(ack_id)
-                        self._complete_write(backuped_node)
-                self.cache_controller.ack_write_queue.clear()
-                self._retry_pending_write_through()
-            return
 
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
@@ -599,17 +575,15 @@ class ContextIDeHiRadixCache(HiRadixCache):
                 blocked_pages = 0
                 continue
 
-            written = self.write_backup(node, write_back=True)
-            if written > 0:
-                self.writing_check(write_back=True)
-                num_evicted += self._evict_backuped(node)
-                blocked_pages = 0
-            elif len(node.children) == 0:
+            if len(node.children) == 0:
+                # HBM eviction never writes a new DRAM backup. Pages without an
+                # existing host copy are dropped directly when safe to delete.
                 num_evicted += self._evict_regular(node)
                 blocked_pages = 0
             else:
-                # An internal radix page cannot be deleted without its subtree.
-                # Keep it in HBM LRU if host pressure temporarily blocks backup.
+                # An unbacked internal radix page cannot be deleted without its
+                # subtree. Keep it in HBM LRU until it becomes a leaf or its
+                # normal write-through copy completes.
                 self.hbm_lru.add_head(node)
                 blocked_pages += 1
 
