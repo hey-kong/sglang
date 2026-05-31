@@ -494,11 +494,8 @@ class ContextIDeHiRadixCache(HiRadixCache):
         return result
 
     def _evict_backuped(self, node: TreeNode):
-        if len(node.children) > 0:
-            # ContextIDe only evicts HBM leaves. Prefix pages become candidates
-            # after their children have been removed from the radix tree.
-            self._mark_hbm(node)
-            return 0
+        # A DRAM-backed page can drop its HBM copy even when it is an internal
+        # radix node. The host copy keeps the prefix available for future loads.
         self.hbm_lru.remove(node)
         num_evicted = super()._evict_backuped(node)
         if node.parent is not None:
@@ -631,14 +628,16 @@ class ContextIDeHiRadixCache(HiRadixCache):
                 break
             if node.value is None or node.lock_ref > 0:
                 continue
-            if len(node.children) > 0:
-                # ContextIDe never evicts an internal HBM prefix page. Keep it in
-                # LRU until DRAM FIFO eviction removes its child prefix nodes.
+            if node.backuped:
+                # Backed-up internal prefix pages can release only their HBM copy
+                # while remaining in the radix tree with their DRAM copy intact.
+                num_evicted += self._evict_backuped(node)
+            elif len(node.children) > 0:
+                # Unbacked internal pages cannot be deleted without deleting their
+                # suffix. Keep them in HBM until their children are removed.
                 self.hbm_lru.add_head(node)
                 blocked_pages += 1
                 continue
-            if node.backuped:
-                num_evicted += self._evict_backuped(node)
             else:
                 # HBM eviction never writes a new DRAM backup. Unbacked leaves
                 # are dropped directly instead of being demoted to host memory.
