@@ -112,6 +112,7 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self.main_freq: dict[int, int] = {}
         self.node_tier: dict[int, str] = {}
         self._contextide_demote_after_write: set[int] = set()
+        self._contextide_main_after_write: set[int] = set()
         self._pending_write_through: OrderedDict[int, TreeNode] = OrderedDict()
 
         logger.info(
@@ -181,27 +182,41 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self.node_tier.pop(node.id, None)
         self._pending_write_through.pop(node.id, None)
         self._contextide_demote_after_write.discard(node.id)
+        self._contextide_main_after_write.discard(node.id)
 
     def _mark_hbm(self, node: TreeNode) -> None:
         if node.value is not None and node.lock_ref == 0:
             self.hbm_lru.add_head(node)
+
+    def _order_fifo_path_leaf_first(self, node: TreeNode, tier: str) -> None:
+        """Keep descendants closer to the FIFO tail than their ancestors.
+
+        FIFO eviction pops from the tail.  Re-inserting the matching path from
+        leaf to root with ``add_head`` therefore makes removable leaf nodes reach
+        the eviction end before their prefix nodes.
+        """
+        fifo = self.small_fifo if tier == "small" else self.main_fifo
+        while node is not None and node != self.root_node:
+            if self.node_tier.get(node.id) == tier:
+                fifo.add_head(node)
+            node = node.parent
 
     def _mark_small(self, node: TreeNode) -> None:
         if node.host_value is None:
             return
         self.main_fifo.remove(node)
         self.main_freq.pop(node.id, None)
-        self.small_fifo.add_head(node)
         self.node_tier[node.id] = "small"
+        self._order_fifo_path_leaf_first(node, "small")
         self._evict_small_fifo_if_needed()
 
     def _promote_to_main(self, node: TreeNode) -> None:
         if node.host_value is None:
             return
         self.small_fifo.remove(node)
-        self.main_fifo.add_head(node)
         self.node_tier[node.id] = "main"
         self.main_freq[node.id] = min(3, self.main_freq.get(node.id, 0) + 1)
+        self._order_fifo_path_leaf_first(node, "main")
         self._evict_main_fifo_if_needed()
 
     def _touch_host_hit_chain(self, last_host_node: TreeNode) -> None:
@@ -290,6 +305,42 @@ class ContextIDeHiRadixCache(HiRadixCache):
         while len(self.ghost_fifo) > self.ghost_capacity_pages:
             self.ghost_fifo.popitem(last=True)
 
+    def _is_ghost_hit(self, node: TreeNode) -> bool:
+        return self._node_hash_key(node) in self.ghost_fifo
+
+    def _consume_ghost_hit(self, node: TreeNode) -> None:
+        self.ghost_fifo.pop(self._node_hash_key(node), None)
+
+    def _admit_new_pages(self, nodes: list[TreeNode]) -> None:
+        """Admit a newly created suffix after checking contiguous ghost hits.
+
+        Pages absent from the ghost FIFO follow the regular write-through path and
+        enter the small FIFO after the host write completes.  A contiguous ghost
+        run is promoted to the main FIFO only in complete ``main_page_size``
+        groups.  Its shorter tail is not written through to DRAM and stays only in
+        HBM, managed by the HBM LRU.
+        """
+        ghost_run = []
+
+        def flush_ghost_run() -> None:
+            main_count = (
+                len(ghost_run) // self.main_pages_per_entry * self.main_pages_per_entry
+            )
+            for ghost_node in ghost_run:
+                self._consume_ghost_hit(ghost_node)
+            for ghost_node in ghost_run[:main_count]:
+                self._contextide_main_after_write.add(ghost_node.id)
+                self._ensure_write_through(ghost_node)
+            ghost_run.clear()
+
+        for node in nodes:
+            if self._is_ghost_hit(node):
+                ghost_run.append(node)
+                continue
+            flush_ghost_run()
+            self._ensure_write_through(node)
+        flush_ghost_run()
+
     def _evict_small_fifo_if_needed(self) -> None:
         blocked_pages = 0
         while len(self.small_fifo) > self.small_capacity_pages:
@@ -346,12 +397,10 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self.evictable_size_ += len(value)
         self._update_leaf_status(parent)
         self._update_leaf_status(new_node)
-        if self.enable_storage or self.enable_kv_cache_events:
-            new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+        # A newly created page missed both HBM and DRAM. Compute its hash now so
+        # insert() can classify the complete new suffix against the ghost FIFO.
+        new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
         self._record_store_event(new_node)
-        # Every newly created ContextIDe page is written through, including pages
-        # produced by chunked prefill. Hit counting remains disabled for chunks.
-        self._ensure_write_through(new_node)
         if not chunked:
             new_node.hit_count += 1
         self._mark_hbm(new_node)
@@ -377,6 +426,7 @@ class ContextIDeHiRadixCache(HiRadixCache):
         remaining_key = key
         remaining_value = value
         total_prefix_length = 0
+        new_nodes = []
         while len(remaining_key) > 0:
             page_key = remaining_key[: self.page_size]
             page_value = remaining_value[: self.page_size]
@@ -404,9 +454,11 @@ class ContextIDeHiRadixCache(HiRadixCache):
                 node = self._add_page_node(
                     node, page_key, page_value, priority, chunked
                 )
+                new_nodes.append(node)
             remaining_key = remaining_key[self.page_size :]
             remaining_value = remaining_value[self.page_size :]
 
+        self._admit_new_pages(new_nodes)
         return InsertResult(prefix_len=original_prefix_len)
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
@@ -442,6 +494,11 @@ class ContextIDeHiRadixCache(HiRadixCache):
         return result
 
     def _evict_backuped(self, node: TreeNode):
+        if len(node.children) > 0:
+            # ContextIDe only evicts HBM leaves. Prefix pages become candidates
+            # after their children have been removed from the radix tree.
+            self._mark_hbm(node)
+            return 0
         self.hbm_lru.remove(node)
         num_evicted = super()._evict_backuped(node)
         if node.parent is not None:
@@ -527,7 +584,11 @@ class ContextIDeHiRadixCache(HiRadixCache):
     def _complete_write(self, backuped_node: TreeNode) -> None:
         self._record_store_event(backuped_node, medium=StorageMedium.CPU)
         self.dec_lock_ref(backuped_node)
-        self._mark_small(backuped_node)
+        if backuped_node.id in self._contextide_main_after_write:
+            self._contextide_main_after_write.discard(backuped_node.id)
+            self._promote_to_main(backuped_node)
+        else:
+            self._mark_small(backuped_node)
         if backuped_node.id in self._contextide_demote_after_write:
             self._contextide_demote_after_write.discard(backuped_node.id)
             if backuped_node.value is not None and backuped_node.lock_ref == 0:
@@ -570,22 +631,19 @@ class ContextIDeHiRadixCache(HiRadixCache):
                 break
             if node.value is None or node.lock_ref > 0:
                 continue
-            if node.backuped:
-                num_evicted += self._evict_backuped(node)
-                blocked_pages = 0
-                continue
-
-            if len(node.children) == 0:
-                # HBM eviction never writes a new DRAM backup. Pages without an
-                # existing host copy are dropped directly when safe to delete.
-                num_evicted += self._evict_regular(node)
-                blocked_pages = 0
-            else:
-                # An unbacked internal radix page cannot be deleted without its
-                # subtree. Keep it in HBM LRU until it becomes a leaf or its
-                # normal write-through copy completes.
+            if len(node.children) > 0:
+                # ContextIDe never evicts an internal HBM prefix page. Keep it in
+                # LRU until DRAM FIFO eviction removes its child prefix nodes.
                 self.hbm_lru.add_head(node)
                 blocked_pages += 1
+                continue
+            if node.backuped:
+                num_evicted += self._evict_backuped(node)
+            else:
+                # HBM eviction never writes a new DRAM backup. Unbacked leaves
+                # are dropped directly instead of being demoted to host memory.
+                num_evicted += self._evict_regular(node)
+            blocked_pages = 0
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
