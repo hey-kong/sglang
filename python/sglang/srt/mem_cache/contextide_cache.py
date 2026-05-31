@@ -185,7 +185,12 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self._contextide_main_after_write.discard(node.id)
 
     def _mark_hbm(self, node: TreeNode) -> None:
-        if node.value is not None and node.lock_ref == 0:
+        if (
+            node is not None
+            and node != self.root_node
+            and node.value is not None
+            and node.lock_ref == 0
+        ):
             self.hbm_lru.add_head(node)
 
     def _order_fifo_path_leaf_first(self, node: TreeNode, tier: str) -> None:
@@ -484,9 +489,10 @@ class ContextIDeHiRadixCache(HiRadixCache):
                 and cur.value is not None
                 and cur.lock_ref == 0
             ):
-                # Main FIFO pages are DRAM-resident after the active request. Only
-                # the non-main tail of a host hit is allowed to remain in HBM LRU.
-                self._evict_backuped(cur)
+                # Main FIFO pages are DRAM-resident after the active request.
+                # Preserve HiRadixCache's contiguous device-prefix invariant:
+                # descendants cannot remain in HBM below a DRAM-only main page.
+                self._evict_hbm_subtree(cur)
             else:
                 self._mark_hbm(cur)
             cur = cur.parent
@@ -589,7 +595,7 @@ class ContextIDeHiRadixCache(HiRadixCache):
         if backuped_node.id in self._contextide_demote_after_write:
             self._contextide_demote_after_write.discard(backuped_node.id)
             if backuped_node.value is not None and backuped_node.lock_ref == 0:
-                self._evict_backuped(backuped_node)
+                self._evict_hbm_subtree(backuped_node)
         if self.enable_storage:
             self.write_backup_storage(backuped_node)
 
