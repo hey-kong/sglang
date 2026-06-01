@@ -111,7 +111,7 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self.ghost_fifo: OrderedDict[str, None] = OrderedDict()
         self.main_freq: dict[int, int] = {}
         self.node_tier: dict[int, str] = {}
-        self._contextide_demote_after_write: set[int] = set()
+        self._contextide_demote_after_write: OrderedDict[int, TreeNode] = OrderedDict()
         self._contextide_main_after_write: set[int] = set()
         self._pending_write_through: OrderedDict[int, TreeNode] = OrderedDict()
 
@@ -150,7 +150,7 @@ class ContextIDeHiRadixCache(HiRadixCache):
         written = self.write_backup(node)
         if written > 0:
             self._pending_write_through.pop(node.id, None)
-            self._contextide_demote_after_write.add(node.id)
+            self._contextide_demote_after_write[node.id] = node
         else:
             # A write can be temporarily blocked by an unfinished parent-prefix
             # write or host pressure. Retry after the next write acknowledgement.
@@ -159,6 +159,18 @@ class ContextIDeHiRadixCache(HiRadixCache):
     def _retry_pending_write_through(self) -> None:
         for node in list(self._pending_write_through.values()):
             self._ensure_write_through(node)
+
+    def _retry_pending_hbm_demotions(self) -> None:
+        """Release HBM copies after write-through once their locks are gone."""
+        for node in list(self._contextide_demote_after_write.values()):
+            if node.value is None:
+                self._contextide_demote_after_write.pop(node.id, None)
+                continue
+            if node.lock_ref > 0:
+                continue
+            _, fully_evicted = self._evict_hbm_subtree(node)
+            if fully_evicted or node.value is None:
+                self._contextide_demote_after_write.pop(node.id, None)
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         if chunked:
@@ -181,7 +193,7 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self.main_freq.pop(node.id, None)
         self.node_tier.pop(node.id, None)
         self._pending_write_through.pop(node.id, None)
-        self._contextide_demote_after_write.discard(node.id)
+        self._contextide_demote_after_write.pop(node.id, None)
         self._contextide_main_after_write.discard(node.id)
 
     def _mark_hbm(self, node: TreeNode) -> None:
@@ -270,6 +282,15 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self._update_leaf_status(node.parent)
         return True
 
+    def _evict_main_host_node(self, node: TreeNode) -> bool:
+        # Main FIFO eviction drops the HBM subtree first. This keeps HBM eviction
+        # leaf-first and prevents a DRAM prefix from being removed while device
+        # pages below it are still resident.
+        _, fully_evicted = self._evict_hbm_subtree(node)
+        if not fully_evicted:
+            return False
+        return self._evict_host_node(node, ghost=False)
+
     def evict_host(self, num_tokens: int):
         target_pages = max(1, (num_tokens + self.page_size - 1) // self.page_size)
         evicted_pages = 0
@@ -296,7 +317,7 @@ class ContextIDeHiRadixCache(HiRadixCache):
                 self.main_fifo.add_head(node)
                 blocked_pages = 0
                 continue
-            if self._evict_host_node(node, ghost=False):
+            if self._evict_main_host_node(node):
                 evicted_pages += 1
                 blocked_pages = 0
             else:
@@ -375,7 +396,7 @@ class ContextIDeHiRadixCache(HiRadixCache):
                 self.main_fifo.add_head(node)
                 blocked_pages = 0
                 continue
-            if self._evict_host_node(node, ghost=False):
+            if self._evict_main_host_node(node):
                 blocked_pages = 0
                 continue
 
@@ -497,6 +518,7 @@ class ContextIDeHiRadixCache(HiRadixCache):
                 self._mark_hbm(cur)
             cur = cur.parent
         self._retry_pending_write_through()
+        self._retry_pending_hbm_demotions()
         return result
 
     def _evict_backuped(self, node: TreeNode):
@@ -592,10 +614,7 @@ class ContextIDeHiRadixCache(HiRadixCache):
             self._promote_to_main(backuped_node)
         else:
             self._mark_small(backuped_node)
-        if backuped_node.id in self._contextide_demote_after_write:
-            self._contextide_demote_after_write.discard(backuped_node.id)
-            if backuped_node.value is not None and backuped_node.lock_ref == 0:
-                self._evict_hbm_subtree(backuped_node)
+        self._retry_pending_hbm_demotions()
         if self.enable_storage:
             self.write_backup_storage(backuped_node)
 
