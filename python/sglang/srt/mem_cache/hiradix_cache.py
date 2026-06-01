@@ -67,37 +67,37 @@ logger = logging.getLogger(__name__)
 
 class HiRadixCache(RadixCache):
 
+    def _create_token_to_kv_pool_host(self, server_args):
+        if isinstance(self.kv_cache, MHATokenToKVPool):
+            pool_cls = MHATokenToKVPoolHost
+        elif isinstance(self.kv_cache, NSATokenToKVPool):
+            # Filled by attach_hybrid_nsa_pool_to_hiradix_cache after storage extra_config is parsed.
+            return None
+        elif isinstance(self.kv_cache, MLATokenToKVPool):
+            pool_cls = MLATokenToKVPoolHost
+        else:
+            raise ValueError(
+                "HiRadixCache only supports MHA, MLA, and NSA (DSA) models"
+            )
+        return pool_cls(
+            self.kv_cache,
+            server_args.hicache_ratio,
+            server_args.hicache_size,
+            self.page_size,
+            server_args.hicache_mem_layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+
+    def _create_cache_controller(self, *args, **kwargs):
+        return HiCacheController(*args, **kwargs)
+
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
-        if isinstance(self.kv_cache, MHATokenToKVPool):
-            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
-                self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
-            )
-        elif isinstance(self.kv_cache, NSATokenToKVPool):
-            # Filled by attach_hybrid_nsa_pool_to_hiradix_cache after storage extra_config is parsed.
-            self.token_to_kv_pool_host = None
-        elif isinstance(self.kv_cache, MLATokenToKVPool):
-            self.token_to_kv_pool_host = MLATokenToKVPoolHost(
-                self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
-            )
-        else:
-            raise ValueError(
-                "HiRadixCache only supports MHA, MLA, and NSA (DSA) models"
-            )
+        self.token_to_kv_pool_host = self._create_token_to_kv_pool_host(server_args)
 
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
@@ -135,7 +135,7 @@ class HiRadixCache(RadixCache):
                 attn_tp_group=self.attn_tp_group,
             )
         else:
-            self.cache_controller = HiCacheController(
+            self.cache_controller = self._create_cache_controller(
                 params.token_to_kv_pool_allocator,
                 self.token_to_kv_pool_host,
                 self.page_size,
