@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import StorageMedium
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+from sglang.srt.mem_cache.memory_pool_host import ContextIDeTokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
 from sglang.srt.mem_cache.utils import compute_node_hash_values
 
@@ -77,6 +78,16 @@ class ContextIDeHiRadixCache(HiRadixCache):
     objects.
     """
 
+    def _create_token_to_kv_pool_host(self, server_args):
+        return ContextIDeTokenToKVPoolHost(
+            device_pool=self.kv_cache,
+            host_to_device_ratio=server_args.hicache_ratio,
+            host_size=server_args.hicache_size,
+            page_size=self.page_size,
+            main_page_size=server_args.main_page_size,
+            main_size_ratio=server_args.main_size_ratio,
+        )
+
     def __init__(self, params, server_args):
         if server_args.main_page_size % params.page_size != 0:
             raise ValueError(
@@ -93,13 +104,13 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self.main_size_ratio = server_args.main_size_ratio
         self.ghost_size_ratio = server_args.ghost_size_ratio
 
-        host_token_capacity = self.cache_controller.mem_pool_host.size
-        host_page_capacity = max(1, host_token_capacity // self.page_size)
-        self.main_capacity_pages = max(
-            1, int(host_page_capacity * self.main_size_ratio)
-        )
+        host_pool = self.cache_controller.mem_pool_host
+        host_page_capacity = max(1, host_pool.size // self.page_size)
         self.small_capacity_pages = max(
-            1, host_page_capacity - self.main_capacity_pages
+            1, host_pool.small_host_pool.size // self.page_size
+        )
+        self.main_capacity_pages = max(
+            1, host_pool.main_host_pool.size // self.page_size
         )
         self.ghost_capacity_pages = max(
             1, int(host_page_capacity * self.ghost_size_ratio)
@@ -113,6 +124,7 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self.node_tier: dict[int, str] = {}
         self._contextide_demote_after_write: OrderedDict[int, TreeNode] = OrderedDict()
         self._contextide_main_after_write: set[int] = set()
+        self._contextide_main_pending: OrderedDict[int, TreeNode] = OrderedDict()
         self._contextide_small_tail_to_hbm: OrderedDict[int, TreeNode] = OrderedDict()
         self._pending_write_through: OrderedDict[int, TreeNode] = OrderedDict()
 
@@ -126,6 +138,20 @@ class ContextIDeHiRadixCache(HiRadixCache):
             self.ghost_capacity_pages,
         )
 
+    def reset(self):
+        super().reset()
+        self.hbm_lru = _ContextIDeNodeList()
+        self.small_fifo = _ContextIDeNodeList()
+        self.main_fifo = _ContextIDeNodeList()
+        self.ghost_fifo.clear()
+        self.main_freq.clear()
+        self.node_tier.clear()
+        self._contextide_demote_after_write.clear()
+        self._contextide_main_after_write.clear()
+        self._contextide_main_pending.clear()
+        self._contextide_small_tail_to_hbm.clear()
+        self._pending_write_through.clear()
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -134,15 +160,7 @@ class ContextIDeHiRadixCache(HiRadixCache):
         hicache_storage_prefetch_policy: Optional[str] = None,
         hicache_write_policy: Optional[str] = None,
     ) -> tuple[bool, str]:
-        # ContextIDe semantics are always write-through, including runtime storage
-        # attachment requests that attempt to update the generic HiCache policy.
-        return super().attach_storage_backend(
-            storage_backend=storage_backend,
-            storage_backend_extra_config_json=storage_backend_extra_config_json,
-            served_model_name=served_model_name,
-            hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
-            hicache_write_policy="write_through",
-        )
+        return False, "ContextIDe does not support an L3 storage backend."
 
     def _ensure_write_through(self, node: TreeNode) -> None:
         if node.backuped or node.value is None:
@@ -196,6 +214,7 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self._pending_write_through.pop(node.id, None)
         self._contextide_demote_after_write.pop(node.id, None)
         self._contextide_main_after_write.discard(node.id)
+        self._contextide_main_pending.pop(node.id, None)
         self._contextide_small_tail_to_hbm.pop(node.id, None)
 
     def _mark_hbm(self, node: TreeNode) -> None:
@@ -237,6 +256,44 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self.main_freq[node.id] = min(3, self.main_freq.get(node.id, 0) + 1)
         self._order_fifo_path_leaf_first(node, "main")
         self._evict_main_fifo_if_needed()
+
+    def _promote_nodes_to_main(self, nodes: list[TreeNode]) -> None:
+        """Repack complete small-page runs into physical main-pool pages."""
+        pool = self.cache_controller.mem_pool_host
+        for offset in range(0, len(nodes), self.main_pages_per_entry):
+            group = nodes[offset : offset + self.main_pages_per_entry]
+            if len(group) != self.main_pages_per_entry:
+                break
+            if all(pool.is_main(node.host_value) for node in group):
+                for node in group:
+                    self._promote_to_main(node)
+                continue
+            if any(
+                node.host_value is None or pool.is_main(node.host_value)
+                for node in group
+            ):
+                continue
+            main_indices = pool.promote_small_pages([node.host_value for node in group])
+            if main_indices is None:
+                continue
+            old_values = [node.host_value for node in group]
+            for index, node in enumerate(group):
+                start = index * self.page_size
+                node.host_value = main_indices[start : start + self.page_size].clone()
+                self._promote_to_main(node)
+            for old_value in old_values:
+                pool.free(old_value)
+
+    def _drain_main_pending(self) -> None:
+        while len(self._contextide_main_pending) >= self.main_pages_per_entry:
+            nodes = list(self._contextide_main_pending.values())[
+                : self.main_pages_per_entry
+            ]
+            if any(not node.backuped for node in nodes):
+                return
+            self._promote_nodes_to_main(nodes)
+            for node in nodes:
+                self._contextide_main_pending.pop(node.id, None)
 
     def _release_small_tail_to_hbm(self, node: TreeNode) -> None:
         """Drop a small-FIFO DRAM copy once its HBM tail page is reusable."""
@@ -280,8 +337,7 @@ class ContextIDeHiRadixCache(HiRadixCache):
         main_aligned_count = (
             len(nodes) // self.main_pages_per_entry * self.main_pages_per_entry
         )
-        for node in nodes[:main_aligned_count]:
-            self._promote_to_main(node)
+        self._promote_nodes_to_main(nodes[:main_aligned_count])
         for node in nodes[main_aligned_count:]:
             # A small-FIFO tail is kept in HBM after the request, not in DRAM.
             # If it is not loaded or is still locked, release its DRAM copy when
@@ -652,7 +708,8 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self.dec_lock_ref(backuped_node)
         if backuped_node.id in self._contextide_main_after_write:
             self._contextide_main_after_write.discard(backuped_node.id)
-            self._promote_to_main(backuped_node)
+            self._contextide_main_pending[backuped_node.id] = backuped_node
+            self._drain_main_pending()
         else:
             self._mark_small(backuped_node)
         self._retry_pending_hbm_demotions()

@@ -665,7 +665,7 @@ class ServerArgs:
     hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
     # None means the user did not explicitly set a layout. It is normalized to
-    # layer_first unless ContextIDe forces page_first_direct.
+    # layer_first for the regular single-pool HiCache path.
     hicache_mem_layout: Optional[str] = None
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
@@ -3463,16 +3463,17 @@ class ServerArgs:
 
         self.enable_hierarchical_cache = True
         self.hicache_write_policy = "write_through"
-        if (
-            self.hicache_mem_layout is not None
-            and self.hicache_mem_layout != "page_first_direct"
-        ):
+        if self.hicache_io_backend != "kernel":
             logger.warning(
-                "ContextIDe requires page_first_direct HiCache memory layout; "
-                "overriding hicache_mem_layout=%s",
-                self.hicache_mem_layout,
+                "ContextIDe uses GPU-assisted kernel I/O; overriding hicache_io_backend=%s",
+                self.hicache_io_backend,
             )
-        self.hicache_mem_layout = "page_first_direct"
+        self.hicache_io_backend = "kernel"
+        # ContextIDe owns two physical host pools with fixed layouts. Keep the
+        # regular layout knob normalized only for compatibility with shared
+        # argument handling; it does not configure either ContextIDe pool.
+        if self.hicache_mem_layout is None:
+            self.hicache_mem_layout = "layer_first"
 
     def _handle_hicache(self):
         """Normalize hicache-related knobs into a valid runtime configuration.
@@ -3488,6 +3489,11 @@ class ServerArgs:
             self.enable_hierarchical_cache
             or self.disaggregation_decode_enable_offload_kvcache
         ):
+            return
+
+        # ContextIDe owns two physical host pools and always uses GPU-assisted
+        # kernel I/O. The generic single-pool layout rewrites do not apply.
+        if self.contextide:
             return
 
         # Step 1: Initial layout-io compatibility normalization.
@@ -4310,6 +4316,8 @@ class ServerArgs:
         if self.contextide:
             self.enable_hierarchical_cache = True
             self.hicache_write_policy = "write_through"
+            if self.hicache_storage_backend is not None:
+                raise ValueError("--contextide does not support an L3 storage backend.")
             if self.main_page_size <= 0:
                 raise ValueError("--main-page-size must be positive.")
             if self.page_size is not None and self.main_page_size % self.page_size != 0:
@@ -4322,9 +4330,13 @@ class ServerArgs:
             if self.ghost_size_ratio <= 0.0:
                 raise ValueError("--ghost-size-ratio must be positive.")
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
-                raise ValueError("--contextide is not compatible with the C++ radix tree.")
+                raise ValueError(
+                    "--contextide is not compatible with the C++ radix tree."
+                )
             if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
-                raise ValueError("--contextide is not compatible with the unified radix tree.")
+                raise ValueError(
+                    "--contextide is not compatible with the unified radix tree."
+                )
 
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(

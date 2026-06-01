@@ -164,6 +164,7 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        require_larger_than_device: bool = True,
     ):
         self.device_pool = device_pool
         self.page_size = page_size
@@ -184,9 +185,10 @@ class HostKVCache(abc.ABC):
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
-        assert (
-            self.size > device_pool.size
-        ), "The host memory should be larger than the device memory with the current protocol"
+        if require_larger_than_device:
+            assert (
+                self.size > device_pool.size
+            ), "The host memory should be larger than the device memory with the current protocol"
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
@@ -301,6 +303,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        require_larger_than_device: bool = True,
     ):
         super().__init__(
             device_pool,
@@ -311,6 +314,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            require_larger_than_device,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
@@ -799,6 +803,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        require_larger_than_device: bool = True,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -810,6 +815,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            require_larger_than_device,
         )
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize
@@ -1183,6 +1189,163 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+
+class ContextIDeTokenToKVPoolHost:
+    """Two physical DRAM pools exposed as one logical ContextIDe host pool.
+
+    Logical indices below ``main_offset`` belong to the page-first small pool.
+    Indices at or above the offset belong to the layer-first main pool.  The
+    facade keeps the existing HiCache controller API while routing kernel I/O
+    to the physical pool that owns each index.
+    """
+
+    layout = "contextide"
+
+    def __init__(
+        self,
+        device_pool: KVCache,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        main_page_size: int,
+        main_size_ratio: float,
+        allocator_type: str = "default",
+    ):
+        if isinstance(device_pool, MHATokenToKVPool):
+            pool_cls = MHATokenToKVPoolHost
+        elif isinstance(device_pool, MLATokenToKVPool):
+            pool_cls = MLATokenToKVPoolHost
+        else:
+            raise ValueError("ContextIDe only supports MHA and MLA KV pools")
+        small_ratio = host_to_device_ratio * (1.0 - main_size_ratio)
+        main_ratio = host_to_device_ratio * main_size_ratio
+        small_size = host_size * (1.0 - main_size_ratio) if host_size > 0 else 0
+        main_size = host_size * main_size_ratio if host_size > 0 else 0
+        common = dict(
+            device_pool=device_pool,
+            allocator_type=allocator_type,
+            require_larger_than_device=False,
+        )
+        self.small_host_pool = pool_cls(
+            host_to_device_ratio=small_ratio,
+            host_size=small_size,
+            page_size=page_size,
+            layout="page_first",
+            **common,
+        )
+        self.main_host_pool = pool_cls(
+            host_to_device_ratio=main_ratio,
+            host_size=main_size,
+            page_size=main_page_size,
+            layout="layer_first",
+            **common,
+        )
+        self.device_pool = device_pool
+        self.page_size = page_size
+        self.main_page_size = main_page_size
+        self.main_offset = self.small_host_pool.size
+        self.size = self.small_host_pool.size + self.main_host_pool.size
+        self.device = self.small_host_pool.device
+        self._main_freed_slots: dict[int, set[int]] = {}
+
+    def clear(self):
+        self.small_host_pool.clear()
+        self.main_host_pool.clear()
+        self._main_freed_slots = {}
+
+    def available_size(self):
+        return (
+            self.small_host_pool.available_size() + self.main_host_pool.available_size()
+        )
+
+    def alloc(self, need_size: int):
+        return self.small_host_pool.alloc(need_size)
+
+    def alloc_main(self, need_size: int):
+        indices = self.main_host_pool.alloc(need_size)
+        return None if indices is None else indices + self.main_offset
+
+    def is_main(self, indices: torch.Tensor) -> bool:
+        return bool(
+            indices.numel() > 0 and torch.all(indices >= self.main_offset).item()
+        )
+
+    def free(self, indices: torch.Tensor) -> int:
+        indices = indices.cpu()
+        small = indices[indices < self.main_offset]
+        main = indices[indices >= self.main_offset] - self.main_offset
+        if small.numel() > 0:
+            self.small_host_pool.free(small)
+        for index in main.tolist():
+            page_start = index // self.main_page_size * self.main_page_size
+            freed = self._main_freed_slots.setdefault(page_start, set())
+            freed.add(index)
+            if len(freed) == self.main_page_size:
+                self.main_host_pool.free(
+                    torch.arange(page_start, page_start + self.main_page_size)
+                )
+                del self._main_freed_slots[page_start]
+        return len(indices)
+
+    def _for_each_pool(self, host_indices, device_indices, callback):
+        small_mask = host_indices < self.main_offset
+        for pool, mask, offset in (
+            (self.small_host_pool, small_mask, 0),
+            (self.main_host_pool, ~small_mask, self.main_offset),
+        ):
+            if torch.any(mask).item():
+                callback(pool, host_indices[mask] - offset, device_indices[mask])
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        assert io_backend == "kernel"
+        self._for_each_pool(
+            host_indices,
+            device_indices,
+            lambda pool, host, device: pool.load_to_device_per_layer(
+                device_pool, host, device, layer_id, io_backend
+            ),
+        )
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        assert io_backend == "kernel"
+        self._for_each_pool(
+            host_indices,
+            device_indices,
+            lambda pool, host, device: pool.backup_from_device_all_layer(
+                device_pool, host, device, io_backend
+            ),
+        )
+
+    def promote_small_pages(self, pages: list[torch.Tensor]):
+        """Copy page-sized small-pool entries into one physical main page."""
+        assert len(pages) * self.page_size == self.main_page_size
+        main = self.alloc_main(self.main_page_size)
+        if main is None:
+            return None
+        main_index = int(main[0].item() - self.main_offset)
+        if isinstance(self.small_host_pool, MHATokenToKVPoolHost):
+            chunks = [
+                self.small_host_pool.get_data_page(
+                    int(page[0].item()), flat=False
+                ).permute(0, 2, 1, 3, 4)
+                for page in pages
+            ]
+            data = torch.cat(chunks, dim=2).flatten()
+        else:
+            chunks = [
+                self.small_host_pool.get_data_page(
+                    int(page[0].item()), flat=False
+                ).permute(1, 0, 2, 3)
+                for page in pages
+            ]
+            data = torch.cat(chunks, dim=1).flatten()
+        self.main_host_pool.set_from_flat_data_page(main_index, data)
+        return main
 
 
 class MambaPoolHost(HostKVCache):
