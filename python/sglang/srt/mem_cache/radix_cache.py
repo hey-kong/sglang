@@ -535,8 +535,12 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
         req.cache_protected_len = len(new_indices)
 
-        self.dec_lock_ref(req.last_node)
+        # Acquire the updated prefix lock before releasing the previous one.
+        # Some cache implementations may immediately evict nodes whose lock count
+        # reaches zero. Keeping overlapping prefixes protected during this handoff
+        # prevents an active request from retaining indices that were just freed.
         self.inc_lock_ref(new_last_node)
+        self.dec_lock_ref(req.last_node)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         # - page_size != 1: there is a partial page at the end, keep the full kv_indices
