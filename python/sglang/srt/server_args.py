@@ -664,7 +664,9 @@ class ServerArgs:
     hicache_size: int = 0
     hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
-    hicache_mem_layout: str = "layer_first"
+    # None means the user did not explicitly set a layout. It is normalized to
+    # layer_first unless ContextIDe forces page_first_direct.
+    hicache_mem_layout: Optional[str] = None
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
@@ -956,6 +958,10 @@ class ServerArgs:
         # the flag/precondition half runs earlier in
         # _validate_prefill_only_disable_kv_cache_args().
         self._handle_prefill_only_disable_kv_cache()
+
+        # Normalize ContextIDe settings before the generic HiCache pass so the
+        # forced layout participates in layout <-> I/O compatibility handling.
+        self._normalize_contextide_hicache()
 
         # Handle Hicache settings.
         self._handle_hicache()
@@ -3447,6 +3453,26 @@ class ServerArgs:
                 f"(fa3/fa4), but got prefill backend {prefill_backend!r}. Other prefill-only "
                 "workloads and backends may be supported in a future change."
             )
+
+    def _normalize_contextide_hicache(self):
+        """Apply ContextIDe HiCache overrides before generic HiCache normalization."""
+        if not self.contextide:
+            if self.hicache_mem_layout is None:
+                self.hicache_mem_layout = "layer_first"
+            return
+
+        self.enable_hierarchical_cache = True
+        self.hicache_write_policy = "write_through"
+        if (
+            self.hicache_mem_layout is not None
+            and self.hicache_mem_layout != "page_first_direct"
+        ):
+            logger.warning(
+                "ContextIDe requires page_first_direct HiCache memory layout; "
+                "overriding hicache_mem_layout=%s",
+                self.hicache_mem_layout,
+            )
+        self.hicache_mem_layout = "page_first_direct"
 
     def _handle_hicache(self):
         """Normalize hicache-related knobs into a valid runtime configuration.

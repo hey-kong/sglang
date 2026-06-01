@@ -113,6 +113,7 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self.node_tier: dict[int, str] = {}
         self._contextide_demote_after_write: OrderedDict[int, TreeNode] = OrderedDict()
         self._contextide_main_after_write: set[int] = set()
+        self._contextide_small_tail_to_hbm: OrderedDict[int, TreeNode] = OrderedDict()
         self._pending_write_through: OrderedDict[int, TreeNode] = OrderedDict()
 
         logger.info(
@@ -195,6 +196,7 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self._pending_write_through.pop(node.id, None)
         self._contextide_demote_after_write.pop(node.id, None)
         self._contextide_main_after_write.discard(node.id)
+        self._contextide_small_tail_to_hbm.pop(node.id, None)
 
     def _mark_hbm(self, node: TreeNode) -> None:
         if (
@@ -236,10 +238,41 @@ class ContextIDeHiRadixCache(HiRadixCache):
         self._order_fifo_path_leaf_first(node, "main")
         self._evict_main_fifo_if_needed()
 
-    def _touch_host_hit_chain(self, last_host_node: TreeNode) -> None:
+    def _release_small_tail_to_hbm(self, node: TreeNode) -> None:
+        """Drop a small-FIFO DRAM copy once its HBM tail page is reusable."""
+        if self.node_tier.get(node.id) != "small":
+            self._contextide_small_tail_to_hbm.pop(node.id, None)
+            return
+        if node.value is None or node.lock_ref > 0:
+            self._contextide_small_tail_to_hbm[node.id] = node
+            return
+
+        self._contextide_small_tail_to_hbm.pop(node.id, None)
+        self.small_fifo.remove(node)
+        self.node_tier.pop(node.id, None)
+        self.evictable_host_leaves.discard(node)
+        if node.host_value is not None:
+            self._record_remove_event(node, medium=StorageMedium.CPU)
+            host_value = node.host_value
+            node.host_value = None
+            self.cache_controller.evict_host(host_value)
+            self._update_host_leaf_status(node)
+            if node.parent is not None:
+                self._update_host_leaf_status(node.parent)
+        self._mark_hbm(node)
+
+    def _touch_host_hit_chain(
+        self, last_host_node: TreeNode, host_hit_length: int
+    ) -> None:
         nodes = []
+        host_hit_pages = host_hit_length // self.page_size
         node = last_host_node
-        while node is not None and node != self.root_node and node.backuped:
+        while (
+            len(nodes) < host_hit_pages
+            and node is not None
+            and node != self.root_node
+            and node.backuped
+        ):
             nodes.append(node)
             node = node.parent
         nodes.reverse()
@@ -250,9 +283,13 @@ class ContextIDeHiRadixCache(HiRadixCache):
         for node in nodes[:main_aligned_count]:
             self._promote_to_main(node)
         for node in nodes[main_aligned_count:]:
-            # Tail pages stay in HBM for the active request.  If already loaded,
-            # refresh HBM LRU; otherwise init_load_back will promote them.
-            self._mark_hbm(node)
+            # A small-FIFO tail is kept in HBM after the request, not in DRAM.
+            # If it is not loaded or is still locked, release its DRAM copy when
+            # the load/request completion decrements the lock reference.
+            if self.node_tier.get(node.id) == "small":
+                self._release_small_tail_to_hbm(node)
+            else:
+                self._mark_hbm(node)
 
     def _is_host_evictable_leaf(self, node: TreeNode) -> bool:
         return (
@@ -517,6 +554,8 @@ class ContextIDeHiRadixCache(HiRadixCache):
             else:
                 self._mark_hbm(cur)
             cur = cur.parent
+        for tail_node in list(self._contextide_small_tail_to_hbm.values()):
+            self._release_small_tail_to_hbm(tail_node)
         self._retry_pending_write_through()
         self._retry_pending_hbm_demotions()
         return result
@@ -594,7 +633,9 @@ class ContextIDeHiRadixCache(HiRadixCache):
                 self._mark_hbm(node)
                 node = node.parent
         if result.host_hit_length > 0:
-            self._touch_host_hit_chain(result.last_host_node)
+            self._touch_host_hit_chain(
+                result.last_host_node, host_hit_length=result.host_hit_length
+            )
         return result
 
     def init_load_back(self, params: InitLoadBackParams):
@@ -649,28 +690,51 @@ class ContextIDeHiRadixCache(HiRadixCache):
         is released.  For HBM eviction purposes it is a leaf only after every HBM
         page below it has been released.  If any page in the subtree is locked,
         keep the ancestors resident so eviction never removes a non-leaf HBM page.
+
+        Use an explicit post-order stack instead of Python recursion because a
+        page-granular radix path can contain thousands of nodes.
         """
-        if node.lock_ref > 0:
-            return 0, False
-
         num_evicted = 0
-        for child in list(node.children.values()):
-            child_evicted, child_subtree_evicted = self._evict_hbm_subtree(child)
-            num_evicted += child_evicted
-            if not child_subtree_evicted:
-                return num_evicted, False
+        stack = [(node, False)]
+        scheduled = set()
+        subtree_evicted = {}
 
-        if node.value is None:
-            return num_evicted, True
-        if node.backuped:
-            return num_evicted + self._evict_backuped(node), True
-        if len(node.children) == 0:
-            return num_evicted + self._evict_regular(node), True
+        while stack:
+            current, expanded = stack.pop()
+            if not expanded:
+                if current.id in scheduled:
+                    continue
+                scheduled.add(current.id)
+                stack.append((current, True))
+                for child in reversed(list(current.children.values())):
+                    if child.id not in scheduled:
+                        stack.append((child, False))
+                continue
 
-        # An unbacked radix node can be deleted only after all of its children
-        # have been removed from the tree. Host-only children intentionally stay
-        # in the radix tree, so keep this node resident instead of demoting it.
-        return num_evicted, False
+            if current.lock_ref > 0 or any(
+                not subtree_evicted.get(child.id, False)
+                for child in current.children.values()
+            ):
+                subtree_evicted[current.id] = False
+                continue
+            if current.value is None:
+                subtree_evicted[current.id] = True
+                continue
+            if current.backuped:
+                num_evicted += self._evict_backuped(current)
+                subtree_evicted[current.id] = True
+                continue
+            if len(current.children) == 0:
+                num_evicted += self._evict_regular(current)
+                subtree_evicted[current.id] = True
+                continue
+
+            # An unbacked radix node can be deleted only after all of its children
+            # have been removed from the tree. Host-only children intentionally stay
+            # in the radix tree, so keep this node resident instead of demoting it.
+            subtree_evicted[current.id] = False
+
+        return num_evicted, subtree_evicted.get(node.id, False)
 
     def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
