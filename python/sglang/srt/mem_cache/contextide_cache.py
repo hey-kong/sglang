@@ -116,18 +116,6 @@ class ContextIDeHiRadixCache(HiRadixCache):
             1, int(host_page_capacity * self.ghost_size_ratio)
         )
 
-        self.hbm_lru = _ContextIDeNodeList()
-        self.small_fifo = _ContextIDeNodeList()
-        self.main_fifo = _ContextIDeNodeList()
-        self.ghost_fifo: OrderedDict[str, None] = OrderedDict()
-        self.main_freq: dict[int, int] = {}
-        self.node_tier: dict[int, str] = {}
-        self._contextide_demote_after_write: OrderedDict[int, TreeNode] = OrderedDict()
-        self._contextide_main_after_write: set[int] = set()
-        self._contextide_main_pending: OrderedDict[int, TreeNode] = OrderedDict()
-        self._contextide_small_tail_to_hbm: OrderedDict[int, TreeNode] = OrderedDict()
-        self._pending_write_through: OrderedDict[int, TreeNode] = OrderedDict()
-
         logger.info(
             "ContextIDe HiCache enabled: page_size=%d main_page_size=%d "
             "small_pages=%d main_pages=%d ghost_pages=%d",
@@ -140,17 +128,21 @@ class ContextIDeHiRadixCache(HiRadixCache):
 
     def reset(self):
         super().reset()
+        # RadixCache.__init__ calls reset() before ContextIDeHiRadixCache.__init__
+        # has initialized its eviction metadata. Recreate the containers instead
+        # of clearing potentially missing attributes so both initialization and
+        # subsequent resets follow the same path.
         self.hbm_lru = _ContextIDeNodeList()
         self.small_fifo = _ContextIDeNodeList()
         self.main_fifo = _ContextIDeNodeList()
-        self.ghost_fifo.clear()
-        self.main_freq.clear()
-        self.node_tier.clear()
-        self._contextide_demote_after_write.clear()
-        self._contextide_main_after_write.clear()
-        self._contextide_main_pending.clear()
-        self._contextide_small_tail_to_hbm.clear()
-        self._pending_write_through.clear()
+        self.ghost_fifo: OrderedDict[str, None] = OrderedDict()
+        self.main_freq: dict[int, int] = {}
+        self.node_tier: dict[int, str] = {}
+        self._contextide_demote_after_write: OrderedDict[int, TreeNode] = OrderedDict()
+        self._contextide_main_after_write: set[int] = set()
+        self._contextide_main_pending: OrderedDict[int, TreeNode] = OrderedDict()
+        self._contextide_small_tail_to_hbm: OrderedDict[int, TreeNode] = OrderedDict()
+        self._pending_write_through: OrderedDict[int, TreeNode] = OrderedDict()
 
     def attach_storage_backend(
         self,
