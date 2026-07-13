@@ -1401,6 +1401,7 @@ class HiRadixCache(RadixCache):
         self._drain_async_work()
         self.writing_check()
         self.loading_check()
+        self.cache_controller.log_exposed_wait_latency()
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:

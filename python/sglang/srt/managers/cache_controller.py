@@ -72,6 +72,9 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        self._consumer_wait_group_id = -1
+        self._pending_exposed_wait_events = []
+        self._completed_exposed_wait_groups = {}
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -84,15 +87,69 @@ class LayerDoneCounter:
 
     def set_consumer(self, index: int):
         self.consumer_index = index
+        if index >= 0:
+            self._consumer_wait_group_id += 1
 
     def wait_until(self, threshold: int):
         if self.consumer_index < 0:
             return
+        try:
+            wait_start_event = device_module.Event(enable_timing=True)
+            wait_end_event = device_module.Event(enable_timing=True)
+            wait_start_event.record()
+            self.events[self.consumer_index].wait(threshold)
+            wait_end_event.record()
+            self._pending_exposed_wait_events.append(
+                (
+                    self._consumer_wait_group_id,
+                    threshold,
+                    wait_start_event,
+                    wait_end_event,
+                )
+            )
+            return
+        except TypeError:
+            # Some backends do not support timed events. Fall back to the normal
+            # synchronization path without collecting latency.
+            pass
         self.events[self.consumer_index].wait(threshold)
 
     def reset(self):
         self.producer_index = -1
         self.consumer_index = -1
+        self._consumer_wait_group_id = -1
+        self._pending_exposed_wait_events.clear()
+        self._completed_exposed_wait_groups.clear()
+
+    def collect_exposed_wait_latency_ms(self) -> List[float]:
+        latencies = []
+        remaining_events = []
+        for (
+            wait_group_id,
+            threshold,
+            wait_start_event,
+            wait_end_event,
+        ) in self._pending_exposed_wait_events:
+            if wait_end_event.query():
+                group_wait_time, saw_final_layer = self._completed_exposed_wait_groups.get(
+                    wait_group_id, (0.0, False)
+                )
+                group_wait_time += wait_start_event.elapsed_time(wait_end_event)
+                saw_final_layer = saw_final_layer or threshold == self.num_layers - 1
+                if saw_final_layer:
+                    latencies.append(group_wait_time)
+                    self._completed_exposed_wait_groups.pop(wait_group_id, None)
+                else:
+                    self._completed_exposed_wait_groups[wait_group_id] = (
+                        group_wait_time,
+                        saw_final_layer,
+                    )
+            else:
+                remaining_events.append(
+                    (wait_group_id, threshold, wait_start_event, wait_end_event)
+                )
+        self._pending_exposed_wait_events = remaining_events
+        return latencies
 
 
 class CacheOperation:
@@ -802,6 +859,14 @@ class HiCacheController:
             )
         )
         return producer_id
+
+    def log_exposed_wait_latency(self) -> None:
+        latencies = self.layer_done_counter.collect_exposed_wait_latency_ms()
+        for latency_ms in latencies:
+            logger.info(
+                "HiCache exposed wait latency beyond layer-transfer overlap: %.3f ms",
+                latency_ms,
+            )
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)
