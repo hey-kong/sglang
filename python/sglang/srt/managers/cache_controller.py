@@ -72,6 +72,7 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        self._pending_non_overlap_wait_events = []
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -88,11 +89,38 @@ class LayerDoneCounter:
     def wait_until(self, threshold: int):
         if self.consumer_index < 0:
             return
+        if threshold == self.num_layers - 1:
+            try:
+                wait_start_event = device_module.Event(enable_timing=True)
+                wait_end_event = device_module.Event(enable_timing=True)
+                wait_start_event.record()
+                self.events[self.consumer_index].wait(threshold)
+                wait_end_event.record()
+                self._pending_non_overlap_wait_events.append(
+                    (wait_start_event, wait_end_event)
+                )
+                return
+            except TypeError:
+                # Some backends do not support timed events. Fall back to the
+                # normal synchronization path without collecting latency.
+                pass
         self.events[self.consumer_index].wait(threshold)
 
     def reset(self):
         self.producer_index = -1
         self.consumer_index = -1
+        self._pending_non_overlap_wait_events.clear()
+
+    def collect_non_overlap_wait_latency_ms(self) -> List[float]:
+        latencies = []
+        remaining_events = []
+        for wait_start_event, wait_end_event in self._pending_non_overlap_wait_events:
+            if wait_end_event.query():
+                latencies.append(wait_start_event.elapsed_time(wait_end_event))
+            else:
+                remaining_events.append((wait_start_event, wait_end_event))
+        self._pending_non_overlap_wait_events = remaining_events
+        return latencies
 
 
 class CacheOperation:
@@ -802,6 +830,14 @@ class HiCacheController:
             )
         )
         return producer_id
+
+    def log_non_overlap_wait_latency(self) -> None:
+        latencies = self.layer_done_counter.collect_non_overlap_wait_latency_ms()
+        for latency_ms in latencies:
+            logger.info(
+                "HiCache non-overlap wait latency for all layer transfers: %.3f ms",
+                latency_ms,
+            )
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)
