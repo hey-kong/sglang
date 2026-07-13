@@ -2465,6 +2465,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._drain_async_work()
         self.writing_check()
         self.loading_check()
+        self.cache_controller.log_non_overlap_wait_latency()
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
